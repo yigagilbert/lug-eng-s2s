@@ -43,16 +43,21 @@ def import_model(
         'depformer_dim', 'depformer_num_heads', 'depformer_num_layers', 'depformer_dim_feedforward',
         'depformer_layer_scale', 'depformer_multi_linear',
         'depformer_max_period', 'depformer_gating', 'depformer_pos_emb', 'depformer_weights_per_step',
-        'depformer_low_rank_embeddings', 'demux_second_stream',
-        'text_card_out']
+        'depformer_low_rank_embeddings', 'demux_second_stream', "text_depth", 
+        'text_card_out',"attention_sink_size"]
     config: dict[str, tp.Any] = {}
     config['card'] = 2048
     config['n_q'] = in_n_q
     config['dep_q'] = out_n_q
     tr_args = omegaconf.OmegaConf.to_object(cfg.transformer_lm)
     config['delays'] = tr_args['delays']
+    
+    
     if len(config['delays']) < out_n_q + 1:
-        config['delays'] = config['delays'] + [config['delays'][-1]] * (out_n_q + 1 - len(config['delays']))
+        if "text_depth" in tr_args:
+            config['delays'] = config['delays'] + [config['delays'][-1]] * (out_n_q + tr_args["text_depth"] - len(config['delays']))
+        else:
+            config['delays'] = config['delays'] + [config['delays'][-1]] * (out_n_q + 1 - len(config['delays']))
     for key in keys:
         if key in cfg.transformer_lm:
             config[key] = tr_args[key]
@@ -92,11 +97,12 @@ def import_model(
     if args.extra_config:
         extra = json.loads(args.extra_config.read_text())
         config.update(extra)
+    config["lm_gen_config"] = {"temp_text":0}
     out_config.write_text(json.dumps(config, indent=2))
 
     kept_weights = max(schedule) + 1
     print(f"Number of dep weights: {num_weights}, keeping {kept_weights}")
-
+    """
     for idx in range(cfg.transformer_lm.depformer_num_layers):
         in_proj_key = f"depformer.layers.{idx}.self_attn.in_proj_weight"
         in_proj = model[in_proj_key]
@@ -106,7 +112,7 @@ def import_model(
         out_proj = model[out_proj_key]
         out_proj = out_proj.view(num_weights, -1, *out_proj.shape[1:])
         model[out_proj_key] = out_proj[:kept_weights].view(-1, *out_proj.shape[2:]).contiguous()
-
+    """
     # For mimi inference, we trim the depformer layer that are unused.
     for dep_idx in range(out_n_q - 1, in_n_q - 1):
         del model[f"depformer_emb.{dep_idx}.weight"]
@@ -119,9 +125,15 @@ def import_model(
         for idx in range(cfg.transformer_lm.depformer_num_layers):
             model.pop(f"depformer.layers.{idx}.gating.{real_idx}.linear_in.weight")
             model.pop(f"depformer.layers.{idx}.gating.{real_idx}.linear_out.weight")
-
+    
+    for idx in range(0,32):
+        model.pop(f"linears.{idx}.weight")
+    if "text_depth" not in config:
+        config["text_depth"] = 1
+    if config["text_depth"] > 1:
+        model.pop("text_linear.weight")
     save_file(model, out_file)
-
+    
 
 def main():
     parser = argparse.ArgumentParser(

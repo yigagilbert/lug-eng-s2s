@@ -397,8 +397,6 @@ class LMModel(StreamingContainer):
                 text_emb = self.text_emb(input_sequence[:, s])
                 text_emb_proj = self.proj_text_embs[s](text_emb)
                 input_ = text_emb_proj if input_ is None else input_ + text_emb_proj
-
-
         
         if sum_condition is not None:
             input_ = input_ + sum_condition.to(input_)
