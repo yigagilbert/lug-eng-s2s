@@ -79,6 +79,65 @@ def _truncate_pair(src: torch.Tensor, tgt: torch.Tensor, max_content_tokens: int
     return src[:src_keep], tgt[:tgt_keep]
 
 
+def _take_tokens(x: torch.Tensor, n: int, mode: str) -> torch.Tensor:
+    if n <= 0:
+        return x[:0]
+    if n >= x.numel():
+        return x
+    if mode == "tail":
+        return x[-n:]
+    return x[:n]
+
+
+def _truncate_pair_with_policy(
+    src: torch.Tensor,
+    tgt: torch.Tensor,
+    max_content_tokens: int,
+    policy: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if src.numel() + tgt.numel() <= max_content_tokens:
+        return src, tgt
+
+    # balanced: keep at least half budget for target when possible.
+    if policy == "balanced":
+        return _truncate_pair(src, tgt, max_content_tokens)
+
+    # head/tail: allocate budget proportionally to original lengths,
+    # and choose which side of each sequence to keep.
+    total = src.numel() + tgt.numel()
+    src_keep = int(round(max_content_tokens * (src.numel() / max(1, total))))
+    tgt_keep = max_content_tokens - src_keep
+
+    # Ensure both sides keep at least one token when both are non-empty.
+    if src.numel() > 0 and tgt.numel() > 0:
+        src_keep = max(1, src_keep)
+        tgt_keep = max(1, tgt_keep)
+        if src_keep + tgt_keep > max_content_tokens:
+            # Remove one token from the larger side to stay on budget.
+            if src_keep >= tgt_keep:
+                src_keep -= 1
+            else:
+                tgt_keep -= 1
+
+    # Respect available lengths and redistribute any leftover budget.
+    src_keep = min(src_keep, src.numel())
+    tgt_keep = min(tgt_keep, tgt.numel())
+    leftover = max_content_tokens - (src_keep + tgt_keep)
+    if leftover > 0:
+        src_room = src.numel() - src_keep
+        add_src = min(leftover, src_room)
+        src_keep += add_src
+        leftover -= add_src
+    if leftover > 0:
+        tgt_room = tgt.numel() - tgt_keep
+        add_tgt = min(leftover, tgt_room)
+        tgt_keep += add_tgt
+
+    src_out = _take_tokens(src, src_keep, mode=policy)
+    tgt_out = _take_tokens(tgt, tgt_keep, mode=policy)
+    return src_out, tgt_out
+
+
 @dataclass
 class PackedIds:
     input_ids: torch.Tensor
@@ -94,11 +153,13 @@ class MimiS2SDataset(Dataset):
         cardinality: int,
         num_codebooks: int,
         audio_token_offset: int,
+        task_marker_id: int,
         src_marker_id: int,
         sep_marker_id: int,
         tgt_marker_id: int,
         eos_id: int,
         bos_id: int | None = None,
+        truncate_policy: str = "balanced",
     ):
         self.items: list[dict[str, Any]] = []
         for manifest in manifests:
@@ -116,14 +177,16 @@ class MimiS2SDataset(Dataset):
         self.cardinality = cardinality
         self.num_codebooks = num_codebooks
         self.audio_token_offset = audio_token_offset
+        self.task_marker_id = task_marker_id
         self.src_marker_id = src_marker_id
         self.sep_marker_id = sep_marker_id
         self.tgt_marker_id = tgt_marker_id
         self.eos_id = eos_id
         self.bos_id = bos_id
+        self.truncate_policy = truncate_policy
 
-        self._fixed_prefix_len = 3 + (1 if bos_id is not None else 0)
-        # Prefix: [BOS?] SRC_MARKER SRC_TOKENS SEP_MARKER TGT_MARKER
+        self._fixed_prefix_len = 4 + (1 if bos_id is not None else 0)
+        # Prefix: [BOS?] TASK_MARKER SRC_MARKER SRC_TOKENS SEP_MARKER TGT_MARKER
         # and we always keep one EOS token at the end.
         if self.max_seq_len <= self._fixed_prefix_len + 1:
             raise RuntimeError("max_seq_len too small for required control tokens.")
@@ -170,11 +233,14 @@ class MimiS2SDataset(Dataset):
 
     def _build_sequence(self, src_audio: torch.Tensor, tgt_audio: torch.Tensor) -> PackedIds:
         max_content = self.max_seq_len - self._fixed_prefix_len - 1  # minus EOS
-        src_audio, tgt_audio = _truncate_pair(src_audio, tgt_audio, max_content)
+        src_audio, tgt_audio = _truncate_pair_with_policy(
+            src_audio, tgt_audio, max_content, policy=self.truncate_policy
+        )
 
         prefix = []
         if self.bos_id is not None:
             prefix.append(self.bos_id)
+        prefix.append(self.task_marker_id)
         prefix.append(self.src_marker_id)
         prefix.extend(src_audio.tolist())
         prefix.append(self.sep_marker_id)
@@ -266,9 +332,10 @@ def evaluate(model, loader: DataLoader, device: torch.device, max_batches: int =
         for i, batch in enumerate(loader):
             batch = _move_to_device(batch, device)
             out = model(**batch)
-            bs = batch["input_ids"].shape[0]
-            total += float(out.loss.item()) * bs
-            n += bs
+            valid_tokens = int((batch["labels"] != IGNORE_INDEX).sum().item())
+            if valid_tokens > 0:
+                total += float(out.loss.item()) * valid_tokens
+                n += valid_tokens
             if max_batches > 0 and (i + 1) >= max_batches:
                 break
     model.train()
@@ -307,8 +374,34 @@ def main() -> None:
                         help="Optional base directory for relative src_codes/tgt_codes paths.")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--base-model", type=str, required=True)
+    parser.add_argument(
+        "--task-token",
+        type=str,
+        default="<TASK_S2ST_EN_LG>",
+        help="Human-readable task token name stored in mapping metadata.",
+    )
 
     parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument(
+        "--truncate-policy",
+        type=str,
+        default="balanced",
+        choices=["balanced", "head", "tail"],
+        help=(
+            "How to truncate src/tgt audio tokens when sequence is too long: "
+            "balanced=half-budget target-first; head=keep starts; tail=keep ends."
+        ),
+    )
+    parser.add_argument(
+        "--context-overflow",
+        type=str,
+        default="error",
+        choices=["error", "clamp"],
+        help=(
+            "Behavior when --max-seq-len exceeds model context. "
+            "error=stop; clamp=reduce to model max_position_embeddings."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--eval-batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -364,13 +457,14 @@ def main() -> None:
 
     base_vocab = model.get_input_embeddings().num_embeddings
     audio_vocab = args.num_codebooks * args.cardinality
-    n_special = 3
+    n_special = 4
     audio_token_offset = base_vocab + n_special
     new_vocab = base_vocab + n_special + audio_vocab
 
-    src_marker_id = base_vocab
-    sep_marker_id = base_vocab + 1
-    tgt_marker_id = base_vocab + 2
+    task_marker_id = base_vocab
+    src_marker_id = base_vocab + 1
+    sep_marker_id = base_vocab + 2
+    tgt_marker_id = base_vocab + 3
 
     print(
         f"Resizing embeddings from {base_vocab} -> {new_vocab} "
@@ -384,10 +478,23 @@ def main() -> None:
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_id
     bos_id = tokenizer.bos_token_id
 
+    model_ctx = getattr(model.config, "max_position_embeddings", None)
+    if isinstance(model_ctx, int) and model_ctx > 0 and args.max_seq_len > model_ctx:
+        msg = (
+            f"--max-seq-len ({args.max_seq_len}) exceeds model context "
+            f"max_position_embeddings ({model_ctx})."
+        )
+        if args.context_overflow == "clamp":
+            print(f"{msg} Clamping max_seq_len to {model_ctx}.")
+            args.max_seq_len = model_ctx
+        else:
+            raise RuntimeError(msg + " Use --context-overflow clamp to auto-adjust.")
+
     target_modules = _build_target_modules(model, args.target_modules)
     modules_to_save = _split_csv(args.modules_to_save)
     print(f"LoRA target modules: {target_modules}")
     print(f"LoRA modules_to_save: {modules_to_save}")
+    print(f"Task token: {args.task_token} (id={task_marker_id})")
     peft_cfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=args.lora_r,
@@ -409,11 +516,13 @@ def main() -> None:
         cardinality=args.cardinality,
         num_codebooks=args.num_codebooks,
         audio_token_offset=audio_token_offset,
+        task_marker_id=task_marker_id,
         src_marker_id=src_marker_id,
         sep_marker_id=sep_marker_id,
         tgt_marker_id=tgt_marker_id,
         eos_id=eos_id,
         bos_id=bos_id,
+        truncate_policy=args.truncate_policy,
     )
     valid_ds = None
     if valid_manifests:
@@ -424,11 +533,13 @@ def main() -> None:
             cardinality=args.cardinality,
             num_codebooks=args.num_codebooks,
             audio_token_offset=audio_token_offset,
+            task_marker_id=task_marker_id,
             src_marker_id=src_marker_id,
             sep_marker_id=sep_marker_id,
             tgt_marker_id=tgt_marker_id,
             eos_id=eos_id,
             bos_id=bos_id,
+            truncate_policy=args.truncate_policy,
         )
 
     collator = CausalCollator(pad_id=pad_id)
@@ -471,14 +582,20 @@ def main() -> None:
         f"valid_samples={(len(valid_ds) if valid_ds is not None else 0)} "
         f"updates={total_updates} warmup={warmup_steps}"
     )
+    if args.max_steps > 0:
+        print(
+            f"--max-steps={args.max_steps} is set; training will continue across epochs "
+            "until that many optimizer updates are reached."
+        )
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
     running_loss = 0.0
     running_count = 0
-    done = False
+    epoch = 0
 
-    for epoch in range(args.epochs):
+    while global_step < total_updates:
+        epoch += 1
         micro_since_update = 0
         for step, batch in enumerate(train_loader):
             batch = _move_to_device(batch, device)
@@ -505,7 +622,7 @@ def main() -> None:
                     lr = scheduler.get_last_lr()[0]
                     print(
                         f"step={global_step}/{total_updates} "
-                        f"epoch={epoch+1} loss={avg_loss:.4f} lr={lr:.2e}"
+                        f"epoch={epoch} loss={avg_loss:.4f} lr={lr:.2e}"
                     )
                     running_loss = 0.0
                     running_count = 0
@@ -526,6 +643,8 @@ def main() -> None:
                             "audio_token_offset": audio_token_offset,
                             "num_codebooks": args.num_codebooks,
                             "cardinality": args.cardinality,
+                            "task_token": args.task_token,
+                            "task_marker_id": task_marker_id,
                             "src_marker_id": src_marker_id,
                             "sep_marker_id": sep_marker_id,
                             "tgt_marker_id": tgt_marker_id,
@@ -537,11 +656,7 @@ def main() -> None:
                     print(f"Saved checkpoint to {ckpt_dir}")
 
                 if global_step >= total_updates:
-                    done = True
                     break
-
-        if done:
-            break
 
     if valid_loader is not None:
         final_val_loss = evaluate(model, valid_loader, device, max_batches=args.eval_max_batches)
@@ -558,6 +673,8 @@ def main() -> None:
             "audio_token_offset": audio_token_offset,
             "num_codebooks": args.num_codebooks,
             "cardinality": args.cardinality,
+            "task_token": args.task_token,
+            "task_marker_id": task_marker_id,
             "src_marker_id": src_marker_id,
             "sep_marker_id": sep_marker_id,
             "tgt_marker_id": tgt_marker_id,
