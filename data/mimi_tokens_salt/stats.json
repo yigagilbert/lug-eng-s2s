@@ -1,0 +1,15 @@
+{
+  "dataset": "yigagilbert/salt-s2s-lug-eng-studio-dataset",
+  "splits": {
+    "train": {
+      "items": 2393
+    },
+    "validation": {
+      "items": 50
+    },
+    "test": {
+      "items": 43
+    }
+  },
+  "total_items": 2486
+}
