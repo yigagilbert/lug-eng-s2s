@@ -12,7 +12,12 @@ from typing import Any
 from huggingface_hub import hf_hub_download
 import torch
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LogitsProcessor,
+    LogitsProcessorList,
+)
 
 from moshi.models import loaders
 
@@ -191,6 +196,48 @@ def _unpack_audio_tokens(
     return codes.unsqueeze(0).long()  # [1, K, T]
 
 
+def _trim_to_whole_frames(audio_tokens: torch.Tensor, num_codebooks: int) -> torch.Tensor:
+    usable = (audio_tokens.numel() // num_codebooks) * num_codebooks
+    if usable <= 0:
+        raise RuntimeError(
+            f"Need at least {num_codebooks} source audio tokens to form one frame, got {audio_tokens.numel()}."
+        )
+    return audio_tokens[:usable]
+
+
+class AudioOnlyLogitsProcessor(LogitsProcessor):
+    def __init__(
+        self,
+        vocab_size: int,
+        audio_low: int,
+        audio_high: int,
+        eos_id: int | None,
+    ):
+        super().__init__()
+        if not (0 <= audio_low < audio_high <= vocab_size):
+            raise RuntimeError(
+                f"Invalid audio token range [{audio_low}, {audio_high}) for vocab_size={vocab_size}."
+            )
+        self.audio_low = audio_low
+        self.audio_high = audio_high
+        self.eos_id = eos_id
+        valid_mask = torch.zeros(vocab_size, dtype=torch.bool)
+        valid_mask[audio_low:audio_high] = True
+        if eos_id is not None:
+            if eos_id < 0 or eos_id >= vocab_size:
+                raise RuntimeError(f"Invalid eos_id={eos_id} for vocab_size={vocab_size}.")
+            valid_mask[eos_id] = True
+        self.valid_mask = valid_mask
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if scores.shape[-1] != self.valid_mask.numel():
+            raise RuntimeError(
+                f"Logits size mismatch: logits={scores.shape[-1]}, mask={self.valid_mask.numel()}."
+            )
+        valid_mask = self.valid_mask.to(device=scores.device)
+        return scores.masked_fill(~valid_mask.unsqueeze(0), float("-inf"))
+
+
 def _load_source_from_manifest(manifest: Path, index: int) -> Path:
     with manifest.open("r", encoding="utf-8") as f:
         for i, ln in enumerate(f):
@@ -238,8 +285,36 @@ def main() -> None:
     parser.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO)
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"])
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--auto-max-new-tokens",
+        action="store_true",
+        help="Estimate max_new_tokens from source frames using --src-to-tgt-frame-ratio.",
+    )
+    parser.add_argument(
+        "--src-to-tgt-frame-ratio",
+        type=float,
+        default=1.0,
+        help="Expected target/source frame ratio for auto max_new_tokens.",
+    )
+    parser.add_argument(
+        "--tgt-frame-bias",
+        type=int,
+        default=0,
+        help="Extra target frames to add when auto estimating length.",
+    )
+    parser.add_argument(
+        "--max-new-tokens-cap",
+        type=int,
+        default=0,
+        help="Optional hard cap for auto max_new_tokens (0 disables cap).",
+    )
     parser.add_argument("--max-src-audio-tokens", type=int, default=0,
                         help="If > 0, truncate packed source-audio tokens to this length.")
+    parser.add_argument(
+        "--disable-logit-mask",
+        action="store_true",
+        help="Disable logits masking to audio/EOS token space during generation.",
+    )
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.95)
@@ -285,6 +360,16 @@ def main() -> None:
     print(f"Loading tokenizer/model base={base_model}")
     tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype)
+    expected_vocab = audio_token_offset + (num_codebooks * cardinality)
+    current_vocab = model.get_input_embeddings().num_embeddings
+    if current_vocab != expected_vocab:
+        if current_vocab > expected_vocab:
+            raise RuntimeError(
+                f"Base model vocab ({current_vocab}) is larger than adapter-expected vocab "
+                f"({expected_vocab}). This mapping/base-model pair is inconsistent."
+            )
+        print(f"Resizing embeddings from {current_vocab} -> {expected_vocab} before loading adapter.")
+        model.resize_token_embeddings(expected_vocab)
     model = PeftModel.from_pretrained(model, adapter_dir)
     model.to(device)
     model.eval()
@@ -329,23 +414,59 @@ def main() -> None:
     if args.max_src_audio_tokens > 0 and src_audio_tokens.numel() > args.max_src_audio_tokens:
         src_audio_tokens = src_audio_tokens[:args.max_src_audio_tokens]
         print(f"Truncated source audio tokens to {src_audio_tokens.numel()} by --max-src-audio-tokens.")
+    src_audio_tokens = _trim_to_whole_frames(src_audio_tokens, num_codebooks=num_codebooks)
 
     max_positions = getattr(model.config, "max_position_embeddings", None)
     fixed_prompt_tokens = (1 if bos_id is not None else 0) + 3 + (1 if task_marker_id is not None else 0)
     # [BOS?] + [TASK?] + src_marker + sep + tgt_marker
+    min_new_tokens = num_codebooks  # at least one audio frame
     if isinstance(max_positions, int) and max_positions > 0:
-        allowed_src = max_positions - fixed_prompt_tokens - args.max_new_tokens
-        if allowed_src <= 0:
+        max_src_for_min = max_positions - fixed_prompt_tokens - min_new_tokens
+        if max_src_for_min <= 0:
             raise RuntimeError(
-                f"max_new_tokens={args.max_new_tokens} leaves no room for source audio "
+                "Model context is too small for this prompt format "
                 f"(model max_position_embeddings={max_positions})."
             )
-        if src_audio_tokens.numel() > allowed_src:
-            src_audio_tokens = src_audio_tokens[:allowed_src]
+        if src_audio_tokens.numel() > max_src_for_min:
+            src_audio_tokens = src_audio_tokens[:max_src_for_min]
+            src_audio_tokens = _trim_to_whole_frames(src_audio_tokens, num_codebooks=num_codebooks)
             print(
                 f"Truncated source audio tokens to {src_audio_tokens.numel()} "
                 f"to fit model context (max_position_embeddings={max_positions})."
             )
+
+    src_frames_effective = src_audio_tokens.numel() // num_codebooks
+    if args.auto_max_new_tokens:
+        if args.src_to_tgt_frame_ratio <= 0:
+            raise RuntimeError("--src-to-tgt-frame-ratio must be > 0 when using --auto-max-new-tokens.")
+        est_tgt_frames = int(round(src_frames_effective * args.src_to_tgt_frame_ratio)) + args.tgt_frame_bias
+        est_tgt_frames = max(1, est_tgt_frames)
+        max_new_tokens = est_tgt_frames * num_codebooks
+        if args.max_new_tokens_cap > 0:
+            max_new_tokens = min(max_new_tokens, args.max_new_tokens_cap)
+        print(
+            f"Auto max_new_tokens from source frames: src_frames={src_frames_effective} "
+            f"ratio={args.src_to_tgt_frame_ratio:.3f} bias={args.tgt_frame_bias} "
+            f"-> max_new_tokens={max_new_tokens}"
+        )
+    else:
+        if args.max_new_tokens <= 0:
+            raise RuntimeError("--max-new-tokens must be > 0 when --auto-max-new-tokens is not set.")
+        max_new_tokens = args.max_new_tokens
+
+    if isinstance(max_positions, int) and max_positions > 0:
+        remaining_for_new = max_positions - fixed_prompt_tokens - src_audio_tokens.numel()
+        if remaining_for_new <= 0:
+            raise RuntimeError(
+                f"No room left for generation after source prompt. "
+                f"max_position_embeddings={max_positions}"
+            )
+        if max_new_tokens > remaining_for_new:
+            print(
+                f"Clamping max_new_tokens from {max_new_tokens} to {remaining_for_new} "
+                "to fit model context."
+            )
+            max_new_tokens = remaining_for_new
 
     prompt = []
     if bos_id is not None:
@@ -362,23 +483,37 @@ def main() -> None:
 
     print(
         f"Generating with prompt_tokens={input_ids.shape[-1]} "
-        f"max_new_tokens={args.max_new_tokens} do_sample={args.do_sample}"
+        f"max_new_tokens={max_new_tokens} do_sample={args.do_sample}"
     )
     if task_marker_id is not None:
         if task_token_label:
             print(f"Using task token: {task_token_label} (id={task_marker_id})")
         else:
             print(f"Using task marker id: {task_marker_id}")
+    logits_processor = None
+    if not args.disable_logit_mask:
+        vocab_size = model.get_input_embeddings().num_embeddings
+        audio_low = audio_token_offset
+        audio_high = audio_token_offset + (num_codebooks * cardinality)
+        logits_processor = LogitsProcessorList(
+            [AudioOnlyLogitsProcessor(vocab_size, audio_low, audio_high, eos_id)]
+        )
+        print(
+            f"Enabled logits mask: allow audio token range [{audio_low}, {audio_high}) "
+            f"and eos_id={eos_id}."
+        )
+
     with torch.no_grad():
         gen = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=args.max_new_tokens,
+            max_new_tokens=max_new_tokens,
             do_sample=args.do_sample,
             temperature=args.temperature if args.do_sample else None,
             top_p=args.top_p if args.do_sample else None,
             eos_token_id=eos_id,
             pad_token_id=(pad_id if pad_id is not None else tokenizer.eos_token_id),
+            logits_processor=logits_processor,
         )
     new_tokens = gen[0, input_ids.shape[-1]:].detach().cpu()
     audio_tokens = _extract_audio_tokens(
