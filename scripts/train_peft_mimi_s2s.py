@@ -6,12 +6,14 @@
 import argparse
 import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+from huggingface_hub import snapshot_download
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
@@ -59,6 +61,24 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
                 continue
             out.append(json.loads(ln))
     return out
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Expected top-level JSON object in config: {path}")
+    return data
+
+
+def _resolve_path(value: str, base_dir: Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (base_dir / path).resolve()
+
+
+def _safe_repo_dir_name(repo_id: str) -> str:
+    return repo_id.replace("/", "__")
 
 
 def _truncate_pair(src: torch.Tensor, tgt: torch.Tensor, max_content_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -362,18 +382,178 @@ def save_artifacts(
     )
 
 
+def _apply_config_overrides(
+    args: argparse.Namespace, config: dict[str, Any], config_path: Path | None
+) -> dict[str, Any]:
+    known_keys = set(vars(args).keys())
+    merged_training = {
+        key: value for key, value in config.items()
+        if key in known_keys and key not in {"config", "hf_token"}
+    }
+    training_cfg = config.get("training", {})
+    if not isinstance(training_cfg, dict):
+        raise RuntimeError("Config field `training` must be an object when provided.")
+    merged_training.update(training_cfg)
+
+    base_dir = config_path.parent if config_path is not None else Path.cwd()
+    path_like_keys = {"output_dir", "codes_root"}
+
+    for key, value in merged_training.items():
+        if key not in known_keys:
+            continue
+        if isinstance(value, list) and key in {"train_manifests", "valid_manifests"}:
+            value = ",".join(str(x) for x in value)
+        if isinstance(value, str) and value and key in path_like_keys:
+            value = str(_resolve_path(value, base_dir))
+        setattr(args, key, value)
+
+    if "hf_token" in config:
+        args.hf_token = str(config["hf_token"])
+
+    data_cfg = config.get("data", {})
+    if data_cfg and not isinstance(data_cfg, dict):
+        raise RuntimeError("Config field `data` must be an object when provided.")
+    return data_cfg if isinstance(data_cfg, dict) else {}
+
+
+def _resolve_hf_token(args: argparse.Namespace, config: dict[str, Any]) -> str | None:
+    if args.hf_token:
+        return args.hf_token
+    token_env = config.get("hf_token_env", "HF_TOKEN")
+    token = os.environ.get(token_env)
+    return token if token else None
+
+
+def _normalize_repo_entry(entry: Any) -> dict[str, Any]:
+    if isinstance(entry, str):
+        return {"repo_id": entry}
+    if isinstance(entry, dict):
+        return dict(entry)
+    raise RuntimeError("Each data repo entry must be either a string repo id or an object.")
+
+
+def _resolve_manifest_paths(
+    repo_root: Path,
+    train_manifest_name: str,
+    valid_manifest_name: str,
+    require_valid: bool,
+) -> tuple[Path, Path | None]:
+    train_manifest = repo_root / train_manifest_name
+    if not train_manifest.exists():
+        raise RuntimeError(f"Missing train manifest at {train_manifest}")
+
+    valid_manifest = repo_root / valid_manifest_name
+    if valid_manifest.exists():
+        return train_manifest, valid_manifest
+    if require_valid:
+        raise RuntimeError(f"Missing validation manifest at {valid_manifest}")
+    return train_manifest, None
+
+
+def _resolve_repo_manifests(
+    args: argparse.Namespace,
+    data_cfg: dict[str, Any],
+    config_path: Path | None,
+    token: str | None,
+) -> tuple[list[Path], list[Path]]:
+    if args.train_manifests:
+        train_manifests = [Path(p) for p in _split_csv(args.train_manifests)]
+        valid_manifests = [Path(p) for p in _split_csv(args.valid_manifests)] if args.valid_manifests else []
+        return train_manifests, valid_manifests
+
+    repo_entries = data_cfg.get("repos", [])
+    if not repo_entries:
+        raise SystemExit(
+            "No training data provided. Set --train-manifests or add data.repos to the config."
+        )
+    if not isinstance(repo_entries, list):
+        raise RuntimeError("Config field `data.repos` must be a list.")
+
+    base_dir = config_path.parent if config_path is not None else Path.cwd()
+    snapshot_dir_value = data_cfg.get("snapshot_dir", "data/hf_mimi_snapshots")
+    snapshot_root = _resolve_path(str(snapshot_dir_value), base_dir)
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    cache_dir = data_cfg.get("cache_dir")
+    cache_dir_path = _resolve_path(str(cache_dir), base_dir) if cache_dir else None
+
+    default_train_manifest = str(data_cfg.get("train_manifest", "dataset.train.jsonl"))
+    default_valid_manifest = str(data_cfg.get("valid_manifest", "dataset.validation.jsonl"))
+    require_valid = bool(data_cfg.get("require_valid_manifest", False))
+
+    train_manifests: list[Path] = []
+    valid_manifests: list[Path] = []
+
+    for raw_repo in repo_entries:
+        repo = _normalize_repo_entry(raw_repo)
+        repo_id = repo.get("repo_id")
+        local_path_value = repo.get("local_path")
+        if local_path_value:
+            repo_root = _resolve_path(str(local_path_value), base_dir)
+            source_desc = str(repo_root)
+        else:
+            if not repo_id:
+                raise RuntimeError("Repo entries must define `repo_id` unless `local_path` is used.")
+            local_dir_value = repo.get("local_dir")
+            if local_dir_value:
+                local_dir = _resolve_path(str(local_dir_value), base_dir)
+            else:
+                local_dir = snapshot_root / _safe_repo_dir_name(str(repo_id))
+            local_dir.mkdir(parents=True, exist_ok=True)
+            repo_token = str(repo.get("token")) if repo.get("token") else token
+            print(f"Syncing dataset repo: {repo_id} -> {local_dir}")
+            repo_root = Path(
+                snapshot_download(
+                    repo_id=str(repo_id),
+                    repo_type=str(repo.get("repo_type", "dataset")),
+                    token=repo_token,
+                    local_dir=str(local_dir),
+                    cache_dir=str(cache_dir_path) if cache_dir_path is not None else None,
+                )
+            )
+            source_desc = str(repo_id)
+
+        train_manifest_name = str(repo.get("train_manifest", default_train_manifest))
+        valid_manifest_name = str(repo.get("valid_manifest", default_valid_manifest))
+        include_train = bool(repo.get("include_train", True))
+        include_valid = bool(repo.get("include_valid", True))
+
+        train_manifest, valid_manifest = _resolve_manifest_paths(
+            repo_root=repo_root,
+            train_manifest_name=train_manifest_name,
+            valid_manifest_name=valid_manifest_name,
+            require_valid=require_valid and include_valid,
+        )
+        if include_train:
+            train_manifests.append(train_manifest)
+        if include_valid and valid_manifest is not None:
+            valid_manifests.append(valid_manifest)
+        print(
+            f"Resolved manifests from {source_desc}: "
+            f"train={train_manifest} "
+            f"valid={valid_manifest if valid_manifest is not None else '(none)'}"
+        )
+
+    if not train_manifests:
+        raise SystemExit("No train manifests were resolved from the configured repos.")
+    return train_manifests, valid_manifests
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train a PEFT/LoRA S2S model on Mimi tokenized manifests."
     )
-    parser.add_argument("--train-manifests", type=str, required=True,
+    parser.add_argument("--config", type=str, default="",
+                        help="Optional JSON config file with training settings and data repos.")
+    parser.add_argument("--hf-token", type=str, default="",
+                        help="Optional HF token for private dataset repos/models.")
+    parser.add_argument("--train-manifests", type=str, default="",
                         help="Comma-separated JSONL manifest paths for training.")
     parser.add_argument("--valid-manifests", type=str, default="",
                         help="Comma-separated JSONL manifest paths for validation.")
     parser.add_argument("--codes-root", type=str, default="",
                         help="Optional base directory for relative src_codes/tgt_codes paths.")
-    parser.add_argument("--output-dir", type=str, required=True)
-    parser.add_argument("--base-model", type=str, required=True)
+    parser.add_argument("--output-dir", type=str, default="")
+    parser.add_argument("--base-model", type=str, default="")
     parser.add_argument(
         "--task-token",
         type=str,
@@ -434,23 +614,41 @@ def main() -> None:
     parser.add_argument("--modules-to-save", type=str, default="embed_tokens,lm_head")
     args = parser.parse_args()
 
+    config_path = Path(args.config).expanduser().resolve() if args.config else None
+    config = _load_json(config_path) if config_path is not None else {}
+    data_cfg = _apply_config_overrides(args, config, config_path)
+    hf_token = _resolve_hf_token(args, config)
+
+    if not args.output_dir:
+        raise SystemExit("Missing output directory. Set --output-dir or `training.output_dir` in the config.")
+    if not args.base_model:
+        raise SystemExit("Missing base model. Set --base-model or `training.base_model` in the config.")
+
     _set_seed(args.seed)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_manifests = [Path(p) for p in _split_csv(args.train_manifests)]
-    if not train_manifests:
-        raise SystemExit("No train manifests provided.")
-    valid_manifests = [Path(p) for p in _split_csv(args.valid_manifests)] if args.valid_manifests else []
+    train_manifests, valid_manifests = _resolve_repo_manifests(args, data_cfg, config_path, hf_token)
     codes_root = Path(args.codes_root) if args.codes_root else None
+    resolved_args = vars(args).copy()
+    resolved_args["config"] = str(config_path) if config_path is not None else ""
+    resolved_args["train_manifests"] = [str(p) for p in train_manifests]
+    resolved_args["valid_manifests"] = [str(p) for p in valid_manifests]
+    resolved_args["hf_token"] = "<redacted>" if hf_token else ""
+    data_cfg_for_save = json.loads(json.dumps(data_cfg)) if data_cfg else {}
+    if isinstance(data_cfg_for_save.get("repos"), list):
+        for repo in data_cfg_for_save["repos"]:
+            if isinstance(repo, dict) and repo.get("token"):
+                repo["token"] = "<redacted>"
+    resolved_args["data"] = data_cfg_for_save
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = _resolve_dtype(args.dtype, device)
 
     print(f"Loading base model: {args.base_model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(args.base_model, torch_dtype=dtype)
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, token=hf_token)
+    model = AutoModelForCausalLM.from_pretrained(args.base_model, torch_dtype=dtype, token=hf_token)
     model.config.use_cache = False
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -637,7 +835,7 @@ def main() -> None:
                         ckpt_dir,
                         model,
                         tokenizer,
-                        training_args=vars(args),
+                        training_args=resolved_args,
                         mapping={
                             "base_model": args.base_model,
                             "audio_token_offset": audio_token_offset,
@@ -667,7 +865,7 @@ def main() -> None:
         final_dir,
         model,
         tokenizer,
-        training_args=vars(args),
+        training_args=resolved_args,
         mapping={
             "base_model": args.base_model,
             "audio_token_offset": audio_token_offset,

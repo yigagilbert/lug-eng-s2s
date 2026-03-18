@@ -1,0 +1,28 @@
+{
+  "hf_token_env": "HF_TOKEN",
+  "data": {
+    "snapshot_dir": "data/hf_mimi_snapshots",
+    "repos": [
+      "yigagilbert/salt-s2s-lug-eng-studio-dataset_mimi_token_version",
+      "your-namespace/your-second-dataset_mimi_token_version"
+    ]
+  },
+  "training": {
+    "output_dir": "checkpoints/lora_mimi_s2s_llama",
+    "base_model": "meta-llama/Llama-3.2-1B-Instruct",
+    "task_token": "<TASK_S2ST_EN_LG>",
+    "max_seq_len": 4096,
+    "context_overflow": "clamp",
+    "truncate_policy": "tail",
+    "max_steps": 2000,
+    "lr": 0.0001,
+    "batch_size": 2,
+    "eval_batch_size": 2,
+    "grad_accum": 8,
+    "eval_every": 200,
+    "save_every": 500,
+    "num_workers": 2,
+    "num_codebooks": 8,
+    "cardinality": 2048
+  }
+}

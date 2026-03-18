@@ -8,12 +8,14 @@ import io
 import json
 import math
 import re
+import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import torch
 from datasets import Audio, load_dataset
-from huggingface_hub import hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download
 
 from moshi.models import loaders
 
@@ -196,6 +198,110 @@ def _split_list(arg: str) -> list[str]:
     return [x.strip() for x in arg.split(",") if x.strip()]
 
 
+def _default_repo_id(dataset_name: str) -> str:
+    if "/" in dataset_name:
+        namespace, name = dataset_name.split("/", 1)
+        return f"{namespace}/{name}_mimi_token_version"
+    return f"{dataset_name}_mimi_token_version"
+
+
+def _write_dataset_card(
+    output_dir: Path,
+    dataset_name: str,
+    dataset_cfg: str | None,
+    repo_id: str,
+    split_names: list[str],
+    stats: dict[str, Any],
+) -> None:
+    config_line = dataset_cfg if dataset_cfg else "(default)"
+    lines = [
+        "# Mimi Token Dataset",
+        "",
+        f"- Source dataset: `{dataset_name}`",
+        f"- Source config: `{config_line}`",
+        f"- Generated repo: `{repo_id}`",
+        f"- Splits: `{', '.join(split_names)}`",
+        f"- Total items: `{stats['total_items']}`",
+        "",
+        "## Layout",
+        "",
+        "- `dataset.<split>.jsonl`: manifest for each split",
+        "- `codes/eng/<split>/*.eng.pt`: source Mimi tokens",
+        "- `codes/lug/<split>/*.lug.pt`: target Mimi tokens",
+        "- `stats.json`: aggregate build stats",
+        "- `build_config.json`: build-time settings",
+        "",
+        "The manifest paths are relative to the dataset repo root so they stay valid after `snapshot_download`.",
+    ]
+    (output_dir / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _flush_pending(
+    mf,
+    pending: list[dict[str, Any]],
+    split: str,
+    output_dir: Path,
+    codes_dir_name: str,
+    dataset_name: str,
+    src_audio_col: str,
+    tgt_audio_col: str,
+    mimi,
+    device: torch.device,
+) -> int:
+    if not pending:
+        return 0
+
+    src_codes = _encode_batch(mimi, [it["src_wav"] for it in pending], device=device)
+    tgt_codes = _encode_batch(mimi, [it["tgt_wav"] for it in pending], device=device)
+
+    for i, item in enumerate(pending):
+        src_rel = Path(codes_dir_name) / "eng" / split / f"{item['safe_id']}.eng.pt"
+        tgt_rel = Path(codes_dir_name) / "lug" / split / f"{item['safe_id']}.lug.pt"
+        src_path = output_dir / src_rel
+        tgt_path = output_dir / tgt_rel
+
+        _save_codes(
+            src_path,
+            src_codes[i].unsqueeze(0),
+            item["src_frames"],
+            mimi.sample_rate,
+            mimi.frame_rate,
+            mimi.num_codebooks,
+            mimi.cardinality,
+            f"{dataset_name}:{split}:{item['idx']}:{src_audio_col}",
+        )
+        _save_codes(
+            tgt_path,
+            tgt_codes[i].unsqueeze(0),
+            item["tgt_frames"],
+            mimi.sample_rate,
+            mimi.frame_rate,
+            mimi.num_codebooks,
+            mimi.cardinality,
+            f"{dataset_name}:{split}:{item['idx']}:{tgt_audio_col}",
+        )
+
+        record = {
+            "split": split,
+            "id": item["id"],
+            "src_text": item["src_text"],
+            "tgt_text": item["tgt_text"],
+            "src_codes": str(src_rel),
+            "tgt_codes": str(tgt_rel),
+            "src_frames": item["src_frames"],
+            "tgt_frames": item["tgt_frames"],
+            "src_pad_samples": item["src_pad"],
+            "tgt_pad_samples": item["tgt_pad"],
+            "sample_rate": mimi.sample_rate,
+            "frame_rate": mimi.frame_rate,
+            "num_codebooks": mimi.num_codebooks,
+            "cardinality": mimi.cardinality,
+        }
+        mf.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+    return len(pending)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -211,7 +317,18 @@ def main() -> None:
         default="train",
         help="Comma-separated splits to process, or `all`.",
     )
-    parser.add_argument("--output", type=str, required=True, help="Output directory.")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="",
+        help="Optional local staging directory. If omitted, a temporary directory is used.",
+    )
+    parser.add_argument(
+        "--repo-id",
+        type=str,
+        default="",
+        help="Target HF dataset repo. Defaults to <dataset>_mimi_token_version.",
+    )
     parser.add_argument("--codes-dir", type=str, default="codes", help="Codes subdirectory.")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda")
@@ -240,13 +357,15 @@ def main() -> None:
         default=loaders.DEFAULT_REPO,
         help="HF repo for Mimi weights when --mimi is not provided.",
     )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help="Create the generated HF dataset repo as private.",
+    )
     args = parser.parse_args()
 
-    output_dir = Path(args.output)
-    codes_dir = output_dir / args.codes_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     token = args.hf_token if args.hf_token else None
+    repo_id = args.repo_id or _default_repo_id(args.dataset)
     dataset_name = args.dataset
     dataset_cfg = args.config if args.config else None
 
@@ -272,164 +391,129 @@ def main() -> None:
 
     global_stats = {
         "dataset": dataset_name,
+        "config": dataset_cfg,
+        "repo_id": repo_id,
         "splits": {},
         "total_items": 0,
     }
+    staging_ctx = nullcontext(args.output) if args.output else tempfile.TemporaryDirectory(
+        prefix="mimi_hf_dataset_"
+    )
+    with staging_ctx as staging_dir:
+        output_dir = Path(staging_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    for split in split_names:
-        ds = load_dataset(dataset_name, dataset_cfg, split=split, token=token)
-        # Disable dataset-side decode to avoid hard dependency on librosa.
-        ds = ds.cast_column(args.src_audio_col, Audio(decode=False))
-        ds = ds.cast_column(args.tgt_audio_col, Audio(decode=False))
+        for split in split_names:
+            ds = load_dataset(dataset_name, dataset_cfg, split=split, token=token)
+            # Disable dataset-side decode to avoid hard dependency on librosa.
+            ds = ds.cast_column(args.src_audio_col, Audio(decode=False))
+            ds = ds.cast_column(args.tgt_audio_col, Audio(decode=False))
 
-        manifest_path = output_dir / f"dataset.{split}.jsonl"
-        stats = {"items": 0}
+            manifest_path = output_dir / f"dataset.{split}.jsonl"
+            stats = {"items": 0}
 
-        with manifest_path.open("w", encoding="utf-8") as mf:
-            pending: list[dict[str, Any]] = []
+            with manifest_path.open("w", encoding="utf-8") as mf:
+                pending: list[dict[str, Any]] = []
 
-            for idx, row in enumerate(ds):
-                row_id = row.get(args.id_col, f"{split}-{idx:09d}")
-                row_id_str = str(row_id)
-                safe_id = _sanitize_key(f"{split}-{idx:09d}-{row_id_str}")
+                for idx, row in enumerate(ds):
+                    row_id = row.get(args.id_col, f"{split}-{idx:09d}")
+                    row_id_str = str(row_id)
+                    safe_id = _sanitize_key(f"{split}-{idx:09d}-{row_id_str}")
 
-                src_wav, src_sr = _audio_to_tensor(row[args.src_audio_col])
-                src_wav = _to_mono(src_wav)
-                src_wav = _resample_if_needed(src_wav, src_sr, mimi.sample_rate)
-                src_wav, src_frames, src_pad = _pad_to_frame(src_wav, frame_size)
+                    src_wav, src_sr = _audio_to_tensor(row[args.src_audio_col])
+                    src_wav = _to_mono(src_wav)
+                    src_wav = _resample_if_needed(src_wav, src_sr, mimi.sample_rate)
+                    src_wav, src_frames, src_pad = _pad_to_frame(src_wav, frame_size)
 
-                tgt_wav, tgt_sr = _audio_to_tensor(row[args.tgt_audio_col])
-                tgt_wav = _to_mono(tgt_wav)
-                tgt_wav = _resample_if_needed(tgt_wav, tgt_sr, mimi.sample_rate)
-                tgt_wav, tgt_frames, tgt_pad = _pad_to_frame(tgt_wav, frame_size)
+                    tgt_wav, tgt_sr = _audio_to_tensor(row[args.tgt_audio_col])
+                    tgt_wav = _to_mono(tgt_wav)
+                    tgt_wav = _resample_if_needed(tgt_wav, tgt_sr, mimi.sample_rate)
+                    tgt_wav, tgt_frames, tgt_pad = _pad_to_frame(tgt_wav, frame_size)
 
-                pending.append(
-                    {
-                        "idx": idx,
-                        "id": row_id_str,
-                        "safe_id": safe_id,
-                        "src_wav": src_wav,
-                        "tgt_wav": tgt_wav,
-                        "src_frames": src_frames,
-                        "tgt_frames": tgt_frames,
-                        "src_pad": src_pad,
-                        "tgt_pad": tgt_pad,
-                        "src_text": str(row.get(args.src_text_col, "")),
-                        "tgt_text": str(row.get(args.tgt_text_col, "")),
-                    }
+                    pending.append(
+                        {
+                            "idx": idx,
+                            "id": row_id_str,
+                            "safe_id": safe_id,
+                            "src_wav": src_wav,
+                            "tgt_wav": tgt_wav,
+                            "src_frames": src_frames,
+                            "tgt_frames": tgt_frames,
+                            "src_pad": src_pad,
+                            "tgt_pad": tgt_pad,
+                            "src_text": str(row.get(args.src_text_col, "")),
+                            "tgt_text": str(row.get(args.tgt_text_col, "")),
+                        }
+                    )
+
+                    if len(pending) == args.batch_size:
+                        stats["items"] += _flush_pending(
+                            mf=mf,
+                            pending=pending,
+                            split=split,
+                            output_dir=output_dir,
+                            codes_dir_name=args.codes_dir,
+                            dataset_name=dataset_name,
+                            src_audio_col=args.src_audio_col,
+                            tgt_audio_col=args.tgt_audio_col,
+                            mimi=mimi,
+                            device=device,
+                        )
+                        pending = []
+
+                stats["items"] += _flush_pending(
+                    mf=mf,
+                    pending=pending,
+                    split=split,
+                    output_dir=output_dir,
+                    codes_dir_name=args.codes_dir,
+                    dataset_name=dataset_name,
+                    src_audio_col=args.src_audio_col,
+                    tgt_audio_col=args.tgt_audio_col,
+                    mimi=mimi,
+                    device=device,
                 )
 
-                if len(pending) == args.batch_size:
-                    src_codes = _encode_batch(
-                        mimi, [it["src_wav"] for it in pending], device=device
-                    )
-                    tgt_codes = _encode_batch(
-                        mimi, [it["tgt_wav"] for it in pending], device=device
-                    )
-                    for i, item in enumerate(pending):
-                        src_rel = Path(args.codes_dir) / "eng" / split / f"{item['safe_id']}.eng.pt"
-                        tgt_rel = Path(args.codes_dir) / "lug" / split / f"{item['safe_id']}.lug.pt"
-                        src_path = output_dir / src_rel
-                        tgt_path = output_dir / tgt_rel
+            global_stats["splits"][split] = stats
+            global_stats["total_items"] += stats["items"]
+            print(f"[{split}] wrote {stats['items']} items to {manifest_path}")
 
-                        _save_codes(
-                            src_path,
-                            src_codes[i].unsqueeze(0),
-                            item["src_frames"],
-                            mimi.sample_rate,
-                            mimi.frame_rate,
-                            mimi.num_codebooks,
-                            mimi.cardinality,
-                            f"{dataset_name}:{split}:{item['idx']}:{args.src_audio_col}",
-                        )
-                        _save_codes(
-                            tgt_path,
-                            tgt_codes[i].unsqueeze(0),
-                            item["tgt_frames"],
-                            mimi.sample_rate,
-                            mimi.frame_rate,
-                            mimi.num_codebooks,
-                            mimi.cardinality,
-                            f"{dataset_name}:{split}:{item['idx']}:{args.tgt_audio_col}",
-                        )
+        build_config = {
+            "source_dataset": dataset_name,
+            "source_config": dataset_cfg,
+            "generated_repo_id": repo_id,
+            "splits": split_names,
+            "codes_dir": args.codes_dir,
+            "id_col": args.id_col,
+            "src_audio_col": args.src_audio_col,
+            "tgt_audio_col": args.tgt_audio_col,
+            "src_text_col": args.src_text_col,
+            "tgt_text_col": args.tgt_text_col,
+            "num_codebooks": mimi.num_codebooks,
+            "cardinality": mimi.cardinality,
+            "sample_rate": mimi.sample_rate,
+            "frame_rate": mimi.frame_rate,
+        }
+        (output_dir / "build_config.json").write_text(
+            json.dumps(build_config, indent=2), encoding="utf-8"
+        )
+        stats_path = output_dir / "stats.json"
+        stats_path.write_text(json.dumps(global_stats, indent=2), encoding="utf-8")
+        _write_dataset_card(output_dir, dataset_name, dataset_cfg, repo_id, split_names, global_stats)
 
-                        record = {
-                            "split": split,
-                            "id": item["id"],
-                            "src_text": item["src_text"],
-                            "tgt_text": item["tgt_text"],
-                            "src_codes": str(src_rel),
-                            "tgt_codes": str(tgt_rel),
-                            "src_frames": item["src_frames"],
-                            "tgt_frames": item["tgt_frames"],
-                            "src_pad_samples": item["src_pad"],
-                            "tgt_pad_samples": item["tgt_pad"],
-                            "sample_rate": mimi.sample_rate,
-                            "frame_rate": mimi.frame_rate,
-                            "num_codebooks": mimi.num_codebooks,
-                            "cardinality": mimi.cardinality,
-                        }
-                        mf.write(json.dumps(record, ensure_ascii=True) + "\n")
-                        stats["items"] += 1
-
-                    pending = []
-
-            if pending:
-                src_codes = _encode_batch(mimi, [it["src_wav"] for it in pending], device=device)
-                tgt_codes = _encode_batch(mimi, [it["tgt_wav"] for it in pending], device=device)
-                for i, item in enumerate(pending):
-                    src_rel = Path(args.codes_dir) / "eng" / split / f"{item['safe_id']}.eng.pt"
-                    tgt_rel = Path(args.codes_dir) / "lug" / split / f"{item['safe_id']}.lug.pt"
-                    src_path = output_dir / src_rel
-                    tgt_path = output_dir / tgt_rel
-
-                    _save_codes(
-                        src_path,
-                        src_codes[i].unsqueeze(0),
-                        item["src_frames"],
-                        mimi.sample_rate,
-                        mimi.frame_rate,
-                        mimi.num_codebooks,
-                        mimi.cardinality,
-                        f"{dataset_name}:{split}:{item['idx']}:{args.src_audio_col}",
-                    )
-                    _save_codes(
-                        tgt_path,
-                        tgt_codes[i].unsqueeze(0),
-                        item["tgt_frames"],
-                        mimi.sample_rate,
-                        mimi.frame_rate,
-                        mimi.num_codebooks,
-                        mimi.cardinality,
-                        f"{dataset_name}:{split}:{item['idx']}:{args.tgt_audio_col}",
-                    )
-
-                    record = {
-                        "split": split,
-                        "id": item["id"],
-                        "src_text": item["src_text"],
-                        "tgt_text": item["tgt_text"],
-                        "src_codes": str(src_rel),
-                        "tgt_codes": str(tgt_rel),
-                        "src_frames": item["src_frames"],
-                        "tgt_frames": item["tgt_frames"],
-                        "src_pad_samples": item["src_pad"],
-                        "tgt_pad_samples": item["tgt_pad"],
-                        "sample_rate": mimi.sample_rate,
-                        "frame_rate": mimi.frame_rate,
-                        "num_codebooks": mimi.num_codebooks,
-                        "cardinality": mimi.cardinality,
-                    }
-                    mf.write(json.dumps(record, ensure_ascii=True) + "\n")
-                    stats["items"] += 1
-
-        global_stats["splits"][split] = stats
-        global_stats["total_items"] += stats["items"]
-        print(f"[{split}] wrote {stats['items']} items to {manifest_path}")
-
-    stats_path = output_dir / "stats.json"
-    stats_path.write_text(json.dumps(global_stats, indent=2), encoding="utf-8")
-    print(f"Wrote global stats to {stats_path}")
+        api = HfApi(token=token)
+        api.create_repo(repo_id=repo_id, repo_type="dataset", private=args.private, exist_ok=True)
+        api.upload_folder(
+            folder_path=str(output_dir),
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=(
+                f"Add Mimi-tokenized dataset for {dataset_name} ({global_stats['total_items']} items)"
+            ),
+        )
+        print(f"Uploaded Mimi-tokenized dataset to {repo_id}")
+        if args.output:
+            print(f"Retained local staging directory at {output_dir}")
 
 
 if __name__ == "__main__":
