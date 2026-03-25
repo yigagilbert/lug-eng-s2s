@@ -44,6 +44,18 @@ def _resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
     return torch.float32
 
 
+def _configure_torch_backend(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -585,6 +597,10 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--eval-batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--persistent-workers", action="store_true",
+                        help="Keep dataloader workers alive between epochs.")
+    parser.add_argument("--prefetch-factor", type=int, default=2,
+                        help="Batches prefetched per worker when num_workers > 0.")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--max-steps", type=int, default=0,
                         help="If > 0, stops after this many optimizer steps.")
@@ -644,7 +660,9 @@ def main() -> None:
     resolved_args["data"] = data_cfg_for_save
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _configure_torch_backend(device)
     dtype = _resolve_dtype(args.dtype, device)
+    print(f"Using device={device} dtype={dtype}")
 
     print(f"Loading base model: {args.base_model}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True, token=hf_token)
@@ -741,24 +759,30 @@ def main() -> None:
         )
 
     collator = CausalCollator(pad_id=pad_id)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collator,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
+    train_loader_kwargs: dict[str, Any] = {
+        "batch_size": args.batch_size,
+        "shuffle": True,
+        "collate_fn": collator,
+        "num_workers": args.num_workers,
+        "pin_memory": (device.type == "cuda"),
+    }
+    if args.num_workers > 0:
+        train_loader_kwargs["persistent_workers"] = args.persistent_workers
+        train_loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    train_loader = DataLoader(train_ds, **train_loader_kwargs)
     valid_loader = None
     if valid_ds is not None:
-        valid_loader = DataLoader(
-            valid_ds,
-            batch_size=args.eval_batch_size,
-            shuffle=False,
-            collate_fn=collator,
-            num_workers=args.num_workers,
-            pin_memory=(device.type == "cuda"),
-        )
+        valid_loader_kwargs: dict[str, Any] = {
+            "batch_size": args.eval_batch_size,
+            "shuffle": False,
+            "collate_fn": collator,
+            "num_workers": args.num_workers,
+            "pin_memory": (device.type == "cuda"),
+        }
+        if args.num_workers > 0:
+            valid_loader_kwargs["persistent_workers"] = args.persistent_workers
+            valid_loader_kwargs["prefetch_factor"] = args.prefetch_factor
+        valid_loader = DataLoader(valid_ds, **valid_loader_kwargs)
 
     updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
     total_updates = args.max_steps if args.max_steps > 0 else updates_per_epoch * args.epochs

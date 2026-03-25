@@ -198,6 +198,24 @@ def _split_list(arg: str) -> list[str]:
     return [x.strip() for x in arg.split(",") if x.strip()]
 
 
+def _resolve_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_arg)
+
+
+def _configure_torch_backend(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+
 def _default_repo_id(dataset_name: str) -> str:
     if "/" in dataset_name:
         namespace, name = dataset_name.split("/", 1)
@@ -331,7 +349,12 @@ def main() -> None:
     )
     parser.add_argument("--codes-dir", type=str, default="codes", help="Codes subdirectory.")
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to run Mimi encoding on: cuda, cpu, or auto.",
+    )
     parser.add_argument("--num-codebooks", type=int, default=8)
     parser.add_argument("--target-sr", type=int, default=24000)
     parser.add_argument("--id-col", type=str, default="id")
@@ -362,12 +385,20 @@ def main() -> None:
         action="store_true",
         help="Create the generated HF dataset repo as private.",
     )
+    parser.add_argument(
+        "--skip-upload",
+        action="store_true",
+        help="Keep the tokenized dataset locally and skip Hugging Face repo upload.",
+    )
     args = parser.parse_args()
 
     token = args.hf_token if args.hf_token else None
     repo_id = args.repo_id or _default_repo_id(args.dataset)
     dataset_name = args.dataset
     dataset_cfg = args.config if args.config else None
+
+    if args.skip_upload and not args.output:
+        raise SystemExit("When --skip-upload is set, provide --output so the local dataset is retained.")
 
     if args.splits == "all":
         ds_dict = load_dataset(dataset_name, dataset_cfg, token=token)
@@ -384,7 +415,9 @@ def main() -> None:
     else:
         mimi_path = Path(hf_hub_download(args.hf_repo, loaders.MIMI_NAME))
 
-    device = torch.device(args.device)
+    device = _resolve_device(args.device)
+    _configure_torch_backend(device)
+    print(f"Using device: {device}")
     mimi = loaders.get_mimi(mimi_path, device=device, num_codebooks=args.num_codebooks)
     mimi.eval()
     frame_size = int(mimi.sample_rate / mimi.frame_rate)
@@ -500,6 +533,10 @@ def main() -> None:
         stats_path = output_dir / "stats.json"
         stats_path.write_text(json.dumps(global_stats, indent=2), encoding="utf-8")
         _write_dataset_card(output_dir, dataset_name, dataset_cfg, repo_id, split_names, global_stats)
+
+        if args.skip_upload:
+            print(f"Skipping upload. Local Mimi-tokenized dataset retained at {output_dir}")
+            return
 
         api = HfApi(token=token)
         api.create_repo(repo_id=repo_id, repo_type="dataset", private=args.private, exist_ok=True)

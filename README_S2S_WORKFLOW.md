@@ -37,7 +37,7 @@ Tokenize dataset 1:
 python3 /workspace/lug-eng-s2s/scripts/build_mimi_hf_dataset.py \
   --dataset yigagilbert/salt-s2s-lug-eng-studio-dataset \
   --splits all \
-  --device cuda \
+  --device auto \
   --batch-size 8 \
   --num-codebooks 8 \
   --hf-token $HF_TOKEN
@@ -71,6 +71,20 @@ python3 /workspace/lug-eng-s2s/scripts/build_mimi_hf_dataset.py \
   --device cuda \
   --batch-size 8 \
   --num-codebooks 8 \
+  --hf-token $HF_TOKEN
+```
+
+Keep the tokenized dataset only on local disk:
+
+```bash
+python3 /workspace/lug-eng-s2s/scripts/build_mimi_hf_dataset.py \
+  --dataset <your-dataset-id> \
+  --splits all \
+  --device auto \
+  --batch-size 8 \
+  --num-codebooks 8 \
+  --output /workspace/lug-eng-s2s/data/local_mimi_tokens/<dataset-name> \
+  --skip-upload \
   --hf-token $HF_TOKEN
 ```
 
@@ -128,6 +142,25 @@ python3 /workspace/lug-eng-s2s/scripts/train_peft_mimi_s2s.py \
   --config /workspace/lug-eng-s2s/configs/mimi_s2s_train.example.json
 ```
 
+You can also train from a local tokenized dataset directory instead of a HF repo:
+
+```bash
+{
+  "hf_token_env": "HF_TOKEN",
+  "data": {
+    "repos": [
+      {
+        "local_path": "data/local_mimi_tokens/your-dataset-name"
+      }
+    ]
+  },
+  "training": {
+    "output_dir": "checkpoints/lora_mimi_s2s_llama",
+    "base_model": "meta-llama/Llama-3.2-1B-Instruct"
+  }
+}
+```
+
 Behavior:
 
 1. The trainer downloads or refreshes each dataset repo in `data.repos`.
@@ -135,6 +168,13 @@ Behavior:
 3. It combines manifests across all listed repos and starts training.
 
 If needed, the older direct-manifest CLI still works, but the config flow is now the recommended path.
+
+### Throughput Notes
+
+1. `build_mimi_hf_dataset.py` now supports `--device auto`, which chooses CUDA when available and otherwise falls back to CPU.
+2. For tokenization throughput, the primary knob is `--batch-size`; increase it until GPU memory is close to full without OOM.
+3. For training throughput, raise `batch_size`, `num_workers`, and use `--persistent-workers` when your dataloader can keep up.
+4. Full 100% GPU utilization is not guaranteed if audio decode or dataset IO is the bottleneck, but these settings help keep the GPU fed.
 
 ### Training Outputs
 
