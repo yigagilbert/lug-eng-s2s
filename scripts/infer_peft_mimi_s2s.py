@@ -54,14 +54,14 @@ def _load_audio(path: Path) -> tuple[torch.Tensor, int]:
     sf = _try_import_soundfile()
     if sf is not None:
         wav, sr = sf.read(str(path), always_2d=True)
-        wav = torch.from_numpy(wav).t().contiguous()  # [C, T]
+        wav = torch.from_numpy(wav).t().to(dtype=torch.float32).contiguous()  # [C, T]
         return wav, int(sr)
 
     ta = _try_import_torchaudio()
     if ta is None:
         raise RuntimeError("No audio backend found. Install either `soundfile` or `torchaudio`.")
     wav, sr = ta.load(str(path))  # [C, T]
-    return wav, int(sr)
+    return wav.to(dtype=torch.float32).contiguous(), int(sr)
 
 
 def _to_mono(wav: torch.Tensor) -> torch.Tensor:
