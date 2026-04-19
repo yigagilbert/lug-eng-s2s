@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    PreTrainedTokenizerBase,
     get_linear_schedule_with_warmup,
 )
 
@@ -93,11 +94,20 @@ def _safe_repo_dir_name(repo_id: str) -> str:
     return repo_id.replace("/", "__")
 
 
+def _take_tokens(x: torch.Tensor, n: int, mode: str) -> torch.Tensor:
+    if n <= 0:
+        return x[:0]
+    if n >= x.numel():
+        return x
+    if mode == "tail":
+        return x[-n:]
+    return x[:n]
+
+
 def _truncate_pair(src: torch.Tensor, tgt: torch.Tensor, max_content_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     if src.numel() + tgt.numel() <= max_content_tokens:
         return src, tgt
 
-    # Keep at least half for target whenever possible.
     tgt_keep = min(tgt.numel(), max(1, max_content_tokens // 2))
     src_keep = max_content_tokens - tgt_keep
     if src.numel() < src_keep:
@@ -109,16 +119,6 @@ def _truncate_pair(src: torch.Tensor, tgt: torch.Tensor, max_content_tokens: int
         tgt_keep = tgt.numel()
         src_keep = min(src.numel(), src_keep + extra)
     return src[:src_keep], tgt[:tgt_keep]
-
-
-def _take_tokens(x: torch.Tensor, n: int, mode: str) -> torch.Tensor:
-    if n <= 0:
-        return x[:0]
-    if n >= x.numel():
-        return x
-    if mode == "tail":
-        return x[-n:]
-    return x[:n]
 
 
 def _truncate_to_frame_boundary(n_tokens: int, num_codebooks: int) -> int:
@@ -146,28 +146,22 @@ def _truncate_pair_with_policy(
         tgt_out = _take_tokens(tgt, tgt_keep, mode="head")
         return src_out, tgt_out
 
-    # balanced: keep at least half budget for target when possible.
     if policy == "balanced":
         return _truncate_pair(src, tgt, max_content_tokens)
 
-    # head/tail: allocate budget proportionally to original lengths,
-    # and choose which side of each sequence to keep.
     total = src.numel() + tgt.numel()
     src_keep = int(round(max_content_tokens * (src.numel() / max(1, total))))
     tgt_keep = max_content_tokens - src_keep
 
-    # Ensure both sides keep at least one token when both are non-empty.
     if src.numel() > 0 and tgt.numel() > 0:
         src_keep = max(1, src_keep)
         tgt_keep = max(1, tgt_keep)
         if src_keep + tgt_keep > max_content_tokens:
-            # Remove one token from the larger side to stay on budget.
             if src_keep >= tgt_keep:
                 src_keep -= 1
             else:
                 tgt_keep -= 1
 
-    # Respect available lengths and redistribute any leftover budget.
     src_keep = min(src_keep, src.numel())
     tgt_keep = min(tgt_keep, tgt.numel())
     leftover = max_content_tokens - (src_keep + tgt_keep)
@@ -192,11 +186,12 @@ class PackedIds:
     labels: torch.Tensor
 
 
-class MimiS2SDataset(Dataset):
+class MimiS2TTDataset(Dataset):
     def __init__(
         self,
         manifests: list[Path],
         codes_root: Path | None,
+        tokenizer: PreTrainedTokenizerBase,
         max_seq_len: int,
         cardinality: int,
         num_codebooks: int,
@@ -206,14 +201,15 @@ class MimiS2SDataset(Dataset):
         sep_marker_id: int,
         tgt_marker_id: int,
         eos_id: int,
+        target_text_key: str,
         bos_id: int | None = None,
         truncate_policy: str = "balanced",
     ):
         self.items: list[dict[str, Any]] = []
         for manifest in manifests:
             rows = _load_jsonl(manifest)
-            for r in rows:
-                rec = dict(r)
+            for row in rows:
+                rec = dict(row)
                 rec["_manifest_dir"] = str(manifest.parent)
                 self.items.append(rec)
 
@@ -221,6 +217,7 @@ class MimiS2SDataset(Dataset):
             raise RuntimeError("No samples found in manifest(s).")
 
         self.codes_root = codes_root
+        self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.cardinality = cardinality
         self.num_codebooks = num_codebooks
@@ -230,12 +227,11 @@ class MimiS2SDataset(Dataset):
         self.sep_marker_id = sep_marker_id
         self.tgt_marker_id = tgt_marker_id
         self.eos_id = eos_id
+        self.target_text_key = target_text_key
         self.bos_id = bos_id
         self.truncate_policy = truncate_policy
 
         self._fixed_prefix_len = 4 + (1 if bos_id is not None else 0)
-        # Prefix: [BOS?] TASK_MARKER SRC_MARKER SRC_TOKENS SEP_MARKER TGT_MARKER
-        # and we always keep one EOS token at the end.
         if self.max_seq_len <= self._fixed_prefix_len + 1:
             raise RuntimeError("max_seq_len too small for required control tokens.")
 
@@ -293,7 +289,7 @@ class MimiS2SDataset(Dataset):
             raise RuntimeError(
                 f"Codebooks mismatch at {path}: expected >= {self.num_codebooks}, got {codes.shape[0]}"
             )
-        codes = codes[: self.num_codebooks].long()  # [K, T]
+        codes = codes[: self.num_codebooks].long()
         if codes.min().item() < 0 or codes.max().item() >= self.cardinality:
             raise RuntimeError(
                 f"Token out of range at {path}: min={codes.min().item()} max={codes.max().item()} "
@@ -302,18 +298,21 @@ class MimiS2SDataset(Dataset):
         return codes
 
     def _pack_audio_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        # [K, T] -> frame-major [T*K], offset each codebook into one shared audio vocab.
         offsets = (torch.arange(self.num_codebooks).unsqueeze(1) * self.cardinality).long()
         packed = (codes + offsets).transpose(0, 1).reshape(-1)
         return packed + self.audio_token_offset
 
-    def _build_sequence(self, src_audio: torch.Tensor, tgt_audio: torch.Tensor) -> PackedIds:
-        max_content = self.max_seq_len - self._fixed_prefix_len - 1  # minus EOS
-        src_audio, tgt_audio = _truncate_pair_with_policy(
-            src_audio, tgt_audio, max_content, policy=self.truncate_policy
+    def _tokenize_target_text(self, text: str) -> torch.Tensor:
+        normalized = " ".join(str(text).strip().split())
+        text_ids = self.tokenizer.encode(normalized, add_special_tokens=False)
+        return torch.tensor(text_ids, dtype=torch.long)
+
+    def _build_sequence(self, src_audio: torch.Tensor, tgt_text_ids: torch.Tensor) -> PackedIds:
+        max_content = self.max_seq_len - self._fixed_prefix_len - 1
+        src_audio, tgt_text_ids = _truncate_pair_with_policy(
+            src_audio, tgt_text_ids, max_content, policy=self.truncate_policy
         )
         src_audio = src_audio[:_truncate_to_frame_boundary(src_audio.numel(), self.num_codebooks)]
-        tgt_audio = tgt_audio[:_truncate_to_frame_boundary(tgt_audio.numel(), self.num_codebooks)]
 
         prefix = []
         if self.bos_id is not None:
@@ -324,8 +323,8 @@ class MimiS2SDataset(Dataset):
         prefix.append(self.sep_marker_id)
         prefix.append(self.tgt_marker_id)
 
-        input_ids = prefix + tgt_audio.tolist() + [self.eos_id]
-        labels = [IGNORE_INDEX] * len(prefix) + tgt_audio.tolist() + [self.eos_id]
+        input_ids = prefix + tgt_text_ids.tolist() + [self.eos_id]
+        labels = [IGNORE_INDEX] * len(prefix) + tgt_text_ids.tolist() + [self.eos_id]
 
         return PackedIds(
             input_ids=torch.tensor(input_ids, dtype=torch.long),
@@ -335,15 +334,13 @@ class MimiS2SDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         item = self.items[idx]
         src_path = self._resolve_path(item["src_codes"], item["_manifest_dir"])
-        tgt_path = self._resolve_path(item["tgt_codes"], item["_manifest_dir"])
-
         src_codes = self._load_codes(src_path, expected_frames=item.get("src_frames"))
-        tgt_codes = self._load_codes(tgt_path, expected_frames=item.get("tgt_frames"))
-
         src_audio = self._pack_audio_codes(src_codes)
-        tgt_audio = self._pack_audio_codes(tgt_codes)
 
-        packed = self._build_sequence(src_audio, tgt_audio)
+        target_text = str(item.get(self.target_text_key, ""))
+        tgt_text_ids = self._tokenize_target_text(target_text)
+
+        packed = self._build_sequence(src_audio, tgt_text_ids)
         return {"input_ids": packed.input_ids, "labels": packed.labels}
 
 
@@ -358,10 +355,10 @@ class CausalCollator:
         labels = torch.full((bsz, max_len), IGNORE_INDEX, dtype=torch.long)
         attention_mask = torch.zeros((bsz, max_len), dtype=torch.long)
         for i, sample in enumerate(batch):
-            l = sample["input_ids"].shape[0]
-            input_ids[i, :l] = sample["input_ids"]
-            labels[i, :l] = sample["labels"]
-            attention_mask[i, :l] = 1
+            length = sample["input_ids"].shape[0]
+            input_ids[i, :length] = sample["input_ids"]
+            labels[i, :length] = sample["labels"]
+            attention_mask[i, :length] = 1
         return {
             "input_ids": input_ids,
             "labels": labels,
@@ -600,7 +597,7 @@ def _resolve_repo_manifests(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train a PEFT/LoRA S2S model on Mimi tokenized manifests."
+        description="Train a PEFT/LoRA speech-to-text translation model on Mimi tokenized manifests."
     )
     parser.add_argument("--config", type=str, default="",
                         help="Optional JSON config file with training settings and data repos.")
@@ -611,14 +608,20 @@ def main() -> None:
     parser.add_argument("--valid-manifests", type=str, default="",
                         help="Comma-separated JSONL manifest paths for validation.")
     parser.add_argument("--codes-root", type=str, default="",
-                        help="Optional base directory for relative src_codes/tgt_codes paths.")
+                        help="Optional base directory for relative src_codes paths.")
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--base-model", type=str, default="")
     parser.add_argument(
         "--task-token",
         type=str,
-        default="<TASK_S2ST_EN_LG>",
-        help="Human-readable task token name stored in mapping metadata.",
+        default="<TASK_S2TT_EN_LG>",
+        help="Human-readable task token label stored in mapping metadata.",
+    )
+    parser.add_argument(
+        "--target-text-key",
+        type=str,
+        default="tgt_text",
+        help="Manifest field containing target-language text.",
     )
 
     parser.add_argument("--max-seq-len", type=int, default=2048)
@@ -628,9 +631,8 @@ def main() -> None:
         default="balanced",
         choices=["balanced", "head", "tail", "src_first"],
         help=(
-            "How to truncate src/tgt audio tokens when sequence is too long: "
-            "balanced=half-budget target-first; head=keep starts; tail=keep ends; "
-            "src_first=prefer keeping source context."
+            "How to truncate source-audio and target-text content when sequence is too long: "
+            "balanced=share budget, head=keep starts, tail=keep ends, src_first=prefer source audio."
         ),
     )
     parser.add_argument(
@@ -780,9 +782,10 @@ def main() -> None:
     model.to(device)
     model.train()
 
-    train_ds = MimiS2SDataset(
+    train_ds = MimiS2TTDataset(
         manifests=train_manifests,
         codes_root=codes_root,
+        tokenizer=tokenizer,
         max_seq_len=args.max_seq_len,
         cardinality=args.cardinality,
         num_codebooks=args.num_codebooks,
@@ -792,14 +795,16 @@ def main() -> None:
         sep_marker_id=sep_marker_id,
         tgt_marker_id=tgt_marker_id,
         eos_id=eos_id,
+        target_text_key=args.target_text_key,
         bos_id=bos_id,
         truncate_policy=args.truncate_policy,
     )
     valid_ds = None
     if valid_manifests:
-        valid_ds = MimiS2SDataset(
+        valid_ds = MimiS2TTDataset(
             manifests=valid_manifests,
             codes_root=codes_root,
+            tokenizer=tokenizer,
             max_seq_len=args.max_seq_len,
             cardinality=args.cardinality,
             num_codebooks=args.num_codebooks,
@@ -809,6 +814,7 @@ def main() -> None:
             sep_marker_id=sep_marker_id,
             tgt_marker_id=tgt_marker_id,
             eos_id=eos_id,
+            target_text_key=args.target_text_key,
             bos_id=bos_id,
             truncate_policy=args.truncate_policy,
         )
@@ -917,7 +923,10 @@ def main() -> None:
                         training_args=resolved_args,
                         mapping={
                             "base_model": args.base_model,
+                            "target_kind": "text",
+                            "target_text_key": args.target_text_key,
                             "audio_token_offset": audio_token_offset,
+                            "text_vocab_size": base_vocab,
                             "num_codebooks": args.num_codebooks,
                             "cardinality": args.cardinality,
                             "task_token": args.task_token,
@@ -947,7 +956,10 @@ def main() -> None:
         training_args=resolved_args,
         mapping={
             "base_model": args.base_model,
+            "target_kind": "text",
+            "target_text_key": args.target_text_key,
             "audio_token_offset": audio_token_offset,
+            "text_vocab_size": base_vocab,
             "num_codebooks": args.num_codebooks,
             "cardinality": args.cardinality,
             "task_token": args.task_token,

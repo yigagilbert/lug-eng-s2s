@@ -4,11 +4,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import concurrent.futures
 import io
 import json
 import math
 import re
 import tempfile
+from collections import deque
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -167,6 +169,7 @@ def _save_codes(
 ):
     payload = {
         "codes": codes[:, :, :frames].cpu().short(),
+        "num_frames": int(frames),
         "num_codebooks": num_codebooks,
         "cardinality": cardinality,
         "frame_rate": frame_rate,
@@ -184,7 +187,10 @@ def _encode_batch(mimi, wavs: list[torch.Tensor], device: torch.device) -> torch
         if w.shape[-1] < max_len:
             w = torch.nn.functional.pad(w, (0, max_len - w.shape[-1]), mode="constant")
         padded.append(w)
-    batch_wav = torch.stack(padded, dim=0).to(device=device)
+    batch_wav = torch.stack(padded, dim=0).contiguous()
+    if device.type == "cuda":
+        batch_wav = batch_wav.pin_memory()
+    batch_wav = batch_wav.to(device=device, non_blocking=(device.type == "cuda"))
     with torch.no_grad():
         return mimi.encode(batch_wav)
 
@@ -252,6 +258,48 @@ def _write_dataset_card(
         "The manifest paths are relative to the dataset repo root so they stay valid after `snapshot_download`.",
     ]
     (output_dir / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _prepare_item(
+    *,
+    idx: int,
+    row: dict[str, Any],
+    split: str,
+    id_col: str,
+    src_audio_col: str,
+    tgt_audio_col: str,
+    src_text_col: str,
+    tgt_text_col: str,
+    sample_rate: int,
+    frame_size: int,
+) -> dict[str, Any]:
+    row_id = row.get(id_col, f"{split}-{idx:09d}")
+    row_id_str = str(row_id)
+    safe_id = _sanitize_key(f"{split}-{idx:09d}-{row_id_str}")
+
+    src_wav, src_sr = _audio_to_tensor(row[src_audio_col])
+    src_wav = _to_mono(src_wav)
+    src_wav = _resample_if_needed(src_wav, src_sr, sample_rate)
+    src_wav, src_frames, src_pad = _pad_to_frame(src_wav, frame_size)
+
+    tgt_wav, tgt_sr = _audio_to_tensor(row[tgt_audio_col])
+    tgt_wav = _to_mono(tgt_wav)
+    tgt_wav = _resample_if_needed(tgt_wav, tgt_sr, sample_rate)
+    tgt_wav, tgt_frames, tgt_pad = _pad_to_frame(tgt_wav, frame_size)
+
+    return {
+        "idx": idx,
+        "id": row_id_str,
+        "safe_id": safe_id,
+        "src_wav": src_wav.contiguous(),
+        "tgt_wav": tgt_wav.contiguous(),
+        "src_frames": src_frames,
+        "tgt_frames": tgt_frames,
+        "src_pad": src_pad,
+        "tgt_pad": tgt_pad,
+        "src_text": str(row.get(src_text_col, "")),
+        "tgt_text": str(row.get(tgt_text_col, "")),
+    }
 
 
 def _flush_pending(
@@ -350,6 +398,21 @@ def main() -> None:
     parser.add_argument("--codes-dir", type=str, default="codes", help="Codes subdirectory.")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
+        "--preprocess-workers",
+        type=int,
+        default=4,
+        help=(
+            "Number of CPU worker threads used to load/decode/resample audio ahead of GPU Mimi encoding. "
+            "Set to 0 or 1 to disable parallel preprocessing."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=4,
+        help="How many future GPU batches to prepare on CPU ahead of time.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -447,52 +510,87 @@ def main() -> None:
 
             with manifest_path.open("w", encoding="utf-8") as mf:
                 pending: list[dict[str, Any]] = []
+                row_iter = enumerate(ds)
+                max_inflight = max(args.batch_size, args.batch_size * max(1, args.prefetch_batches))
 
-                for idx, row in enumerate(ds):
-                    row_id = row.get(args.id_col, f"{split}-{idx:09d}")
-                    row_id_str = str(row_id)
-                    safe_id = _sanitize_key(f"{split}-{idx:09d}-{row_id_str}")
-
-                    src_wav, src_sr = _audio_to_tensor(row[args.src_audio_col])
-                    src_wav = _to_mono(src_wav)
-                    src_wav = _resample_if_needed(src_wav, src_sr, mimi.sample_rate)
-                    src_wav, src_frames, src_pad = _pad_to_frame(src_wav, frame_size)
-
-                    tgt_wav, tgt_sr = _audio_to_tensor(row[args.tgt_audio_col])
-                    tgt_wav = _to_mono(tgt_wav)
-                    tgt_wav = _resample_if_needed(tgt_wav, tgt_sr, mimi.sample_rate)
-                    tgt_wav, tgt_frames, tgt_pad = _pad_to_frame(tgt_wav, frame_size)
-
-                    pending.append(
-                        {
-                            "idx": idx,
-                            "id": row_id_str,
-                            "safe_id": safe_id,
-                            "src_wav": src_wav,
-                            "tgt_wav": tgt_wav,
-                            "src_frames": src_frames,
-                            "tgt_frames": tgt_frames,
-                            "src_pad": src_pad,
-                            "tgt_pad": tgt_pad,
-                            "src_text": str(row.get(args.src_text_col, "")),
-                            "tgt_text": str(row.get(args.tgt_text_col, "")),
-                        }
+                def submit_next(executor, queue: deque[concurrent.futures.Future]) -> bool:
+                    try:
+                        idx, row = next(row_iter)
+                    except StopIteration:
+                        return False
+                    future = executor.submit(
+                        _prepare_item,
+                        idx=idx,
+                        row=row,
+                        split=split,
+                        id_col=args.id_col,
+                        src_audio_col=args.src_audio_col,
+                        tgt_audio_col=args.tgt_audio_col,
+                        src_text_col=args.src_text_col,
+                        tgt_text_col=args.tgt_text_col,
+                        sample_rate=mimi.sample_rate,
+                        frame_size=frame_size,
                     )
+                    queue.append(future)
+                    return True
 
-                    if len(pending) == args.batch_size:
-                        stats["items"] += _flush_pending(
-                            mf=mf,
-                            pending=pending,
-                            split=split,
-                            output_dir=output_dir,
-                            codes_dir_name=args.codes_dir,
-                            dataset_name=dataset_name,
-                            src_audio_col=args.src_audio_col,
-                            tgt_audio_col=args.tgt_audio_col,
-                            mimi=mimi,
-                            device=device,
+                if args.preprocess_workers > 1:
+                    inflight: deque[concurrent.futures.Future] = deque()
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=args.preprocess_workers) as executor:
+                        while len(inflight) < max_inflight and submit_next(executor, inflight):
+                            pass
+
+                        while inflight:
+                            item = inflight.popleft().result()
+                            pending.append(item)
+                            while len(inflight) < max_inflight and submit_next(executor, inflight):
+                                pass
+
+                            if len(pending) == args.batch_size:
+                                stats["items"] += _flush_pending(
+                                    mf=mf,
+                                    pending=pending,
+                                    split=split,
+                                    output_dir=output_dir,
+                                    codes_dir_name=args.codes_dir,
+                                    dataset_name=dataset_name,
+                                    src_audio_col=args.src_audio_col,
+                                    tgt_audio_col=args.tgt_audio_col,
+                                    mimi=mimi,
+                                    device=device,
+                                )
+                                pending = []
+                else:
+                    for idx, row in row_iter:
+                        pending.append(
+                            _prepare_item(
+                                idx=idx,
+                                row=row,
+                                split=split,
+                                id_col=args.id_col,
+                                src_audio_col=args.src_audio_col,
+                                tgt_audio_col=args.tgt_audio_col,
+                                src_text_col=args.src_text_col,
+                                tgt_text_col=args.tgt_text_col,
+                                sample_rate=mimi.sample_rate,
+                                frame_size=frame_size,
+                            )
                         )
-                        pending = []
+
+                        if len(pending) == args.batch_size:
+                            stats["items"] += _flush_pending(
+                                mf=mf,
+                                pending=pending,
+                                split=split,
+                                output_dir=output_dir,
+                                codes_dir_name=args.codes_dir,
+                                dataset_name=dataset_name,
+                                src_audio_col=args.src_audio_col,
+                                tgt_audio_col=args.tgt_audio_col,
+                                mimi=mimi,
+                                device=device,
+                            )
+                            pending = []
 
                 stats["items"] += _flush_pending(
                     mf=mf,

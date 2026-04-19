@@ -104,6 +104,7 @@ def _save_codes(
 ):
     payload = {
         "codes": codes[:, :, :frames].cpu().short(),
+        "num_frames": int(frames),
         "num_codebooks": num_codebooks,
         "cardinality": cardinality,
         "frame_rate": frame_rate,
