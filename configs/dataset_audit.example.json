@@ -1,0 +1,19 @@
+{
+  "hf_token_env": "HF_TOKEN",
+  "datasets": [
+    {
+      "repo_id": "yigagilbert/salt-s2s-lug-eng-studio-dataset",
+      "config": null,
+      "splits": [
+        "train",
+        "validation"
+      ],
+      "id_col": "id",
+      "src_audio_col": "audio_lug",
+      "tgt_audio_col": "audio_eng",
+      "src_text_col": "text_lug",
+      "tgt_text_col": "text_eng",
+      "max_samples_per_split": 0
+    }
+  ]
+}

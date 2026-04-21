@@ -2,6 +2,12 @@
 # Copyright (c) Kyutai, all rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+"""Train a PEFT speech-to-speech model on Mimi-tokenized manifests.
+
+This trainer learns a Luganda-speech to English-speech mapping by turning both
+source and target Mimi codes into one shared causal language-model sequence. The
+dataset format it consumes is produced by `build_mimi_hf_dataset.py`.
+"""
 
 import argparse
 import json
@@ -27,10 +33,12 @@ IGNORE_INDEX = -100
 
 
 def _split_csv(arg: str) -> list[str]:
+    """Split a comma-separated CLI/config value into trimmed entries."""
     return [x.strip() for x in arg.split(",") if x.strip()]
 
 
 def _resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
+    """Pick an execution dtype compatible with the requested device."""
     if dtype == "fp32":
         return torch.float32
     if dtype == "fp16":
@@ -45,6 +53,7 @@ def _resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
 
 
 def _configure_torch_backend(device: torch.device) -> None:
+    """Enable CUDA backend settings that improve training throughput."""
     if device.type != "cuda":
         return
     if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
@@ -57,6 +66,7 @@ def _configure_torch_backend(device: torch.device) -> None:
 
 
 def _set_seed(seed: int) -> None:
+    """Seed Python and torch RNGs for more reproducible training runs."""
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -65,6 +75,7 @@ def _set_seed(seed: int) -> None:
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Load a JSONL manifest into memory."""
     out = []
     with path.open("r", encoding="utf-8") as f:
         for ln in f:
@@ -76,6 +87,7 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _load_json(path: Path) -> dict[str, Any]:
+    """Load and validate a JSON config file."""
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise RuntimeError(f"Expected top-level JSON object in config: {path}")
@@ -83,6 +95,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _resolve_path(value: str, base_dir: Path) -> Path:
+    """Resolve a potentially relative path against a config directory."""
     path = Path(value).expanduser()
     if path.is_absolute():
         return path
@@ -90,10 +103,12 @@ def _resolve_path(value: str, base_dir: Path) -> Path:
 
 
 def _safe_repo_dir_name(repo_id: str) -> str:
+    """Turn a repo id into a stable local snapshot directory name."""
     return repo_id.replace("/", "__")
 
 
 def _truncate_pair(src: torch.Tensor, tgt: torch.Tensor, max_content_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Truncate a source/target pair while reserving a reasonable target budget."""
     if src.numel() + tgt.numel() <= max_content_tokens:
         return src, tgt
 
@@ -112,6 +127,7 @@ def _truncate_pair(src: torch.Tensor, tgt: torch.Tensor, max_content_tokens: int
 
 
 def _take_tokens(x: torch.Tensor, n: int, mode: str) -> torch.Tensor:
+    """Take `n` tokens from the head or tail of a 1D tensor."""
     if n <= 0:
         return x[:0]
     if n >= x.numel():
@@ -122,6 +138,7 @@ def _take_tokens(x: torch.Tensor, n: int, mode: str) -> torch.Tensor:
 
 
 def _truncate_to_frame_boundary(n_tokens: int, num_codebooks: int) -> int:
+    """Round a packed-audio token count down to a full number of Mimi frames."""
     return (n_tokens // num_codebooks) * num_codebooks
 
 
@@ -131,6 +148,7 @@ def _truncate_pair_with_policy(
     max_content_tokens: int,
     policy: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the configured truncation strategy to source and target audio tokens."""
     if src.numel() + tgt.numel() <= max_content_tokens:
         return src, tgt
 
@@ -188,11 +206,13 @@ def _truncate_pair_with_policy(
 
 @dataclass
 class PackedIds:
+    """Prepared causal-LM inputs and labels for one training example."""
     input_ids: torch.Tensor
     labels: torch.Tensor
 
 
 class MimiS2SDataset(Dataset):
+    """Dataset that converts Mimi source/target code files into causal-LM examples."""
     def __init__(
         self,
         manifests: list[Path],
@@ -240,9 +260,11 @@ class MimiS2SDataset(Dataset):
             raise RuntimeError("max_seq_len too small for required control tokens.")
 
     def __len__(self) -> int:
+        """Return the number of manifest rows available for training."""
         return len(self.items)
 
     def _resolve_path(self, raw: str, manifest_dir: str) -> Path:
+        """Resolve relative Mimi code paths against `codes_root` or the manifest directory."""
         p = Path(raw)
         if p.is_absolute():
             return p
@@ -251,6 +273,7 @@ class MimiS2SDataset(Dataset):
         return Path(manifest_dir) / p
 
     def _load_codes(self, path: Path, expected_frames: int | None = None) -> torch.Tensor:
+        """Load one Mimi code tensor and validate codebook/frame metadata."""
         payload = torch.load(path, map_location="cpu")
         stored_frames = None
         if isinstance(payload, dict):
@@ -302,12 +325,14 @@ class MimiS2SDataset(Dataset):
         return codes
 
     def _pack_audio_codes(self, codes: torch.Tensor) -> torch.Tensor:
+        """Pack `[codebook, frame]` Mimi indices into one flat audio-token stream."""
         # [K, T] -> frame-major [T*K], offset each codebook into one shared audio vocab.
         offsets = (torch.arange(self.num_codebooks).unsqueeze(1) * self.cardinality).long()
         packed = (codes + offsets).transpose(0, 1).reshape(-1)
         return packed + self.audio_token_offset
 
     def _build_sequence(self, src_audio: torch.Tensor, tgt_audio: torch.Tensor) -> PackedIds:
+        """Assemble the causal-LM prompt and supervised target sequence for STS."""
         max_content = self.max_seq_len - self._fixed_prefix_len - 1  # minus EOS
         src_audio, tgt_audio = _truncate_pair_with_policy(
             src_audio, tgt_audio, max_content, policy=self.truncate_policy
@@ -333,6 +358,7 @@ class MimiS2SDataset(Dataset):
         )
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        """Load one manifest row and convert it into padded-model-ready tensors."""
         item = self.items[idx]
         src_path = self._resolve_path(item["src_codes"], item["_manifest_dir"])
         tgt_path = self._resolve_path(item["tgt_codes"], item["_manifest_dir"])
@@ -348,10 +374,12 @@ class MimiS2SDataset(Dataset):
 
 
 class CausalCollator:
+    """Pad variable-length causal-LM samples into a batch."""
     def __init__(self, pad_id: int):
         self.pad_id = pad_id
 
     def __call__(self, batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        """Create padded `input_ids`, `labels`, and `attention_mask` tensors."""
         max_len = max(x["input_ids"].shape[0] for x in batch)
         bsz = len(batch)
         input_ids = torch.full((bsz, max_len), self.pad_id, dtype=torch.long)
@@ -370,10 +398,12 @@ class CausalCollator:
 
 
 def _move_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    """Move a collated batch onto the training device."""
     return {k: v.to(device=device, non_blocking=True) for k, v in batch.items()}
 
 
 def _build_target_modules(model, target_modules_arg: str) -> list[str]:
+    """Resolve the LoRA target module list from CLI input or model inspection."""
     if target_modules_arg != "auto":
         out = _split_csv(target_modules_arg)
         if not out:
@@ -403,6 +433,7 @@ def _build_target_modules(model, target_modules_arg: str) -> list[str]:
 
 
 def evaluate(model, loader: DataLoader, device: torch.device, max_batches: int = 0) -> float:
+    """Compute average token loss over a validation loader."""
     was_training = model.training
     model.eval()
     total = 0.0
@@ -431,6 +462,7 @@ def save_artifacts(
     training_args: dict[str, Any],
     mapping: dict[str, Any],
 ) -> None:
+    """Save adapter weights, tokenizer files, config, and token mapping metadata."""
     save_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
@@ -445,6 +477,7 @@ def save_artifacts(
 def _apply_config_overrides(
     args: argparse.Namespace, config: dict[str, Any], config_path: Path | None
 ) -> dict[str, Any]:
+    """Merge JSON config values into parsed CLI args and return the data section."""
     known_keys = set(vars(args).keys())
     merged_training = {
         key: value for key, value in config.items()
@@ -477,6 +510,7 @@ def _apply_config_overrides(
 
 
 def _resolve_hf_token(args: argparse.Namespace, config: dict[str, Any]) -> str | None:
+    """Resolve the Hugging Face token from CLI first, then configured env var."""
     if args.hf_token:
         return args.hf_token
     token_env = config.get("hf_token_env", "HF_TOKEN")
@@ -485,6 +519,7 @@ def _resolve_hf_token(args: argparse.Namespace, config: dict[str, Any]) -> str |
 
 
 def _normalize_repo_entry(entry: Any) -> dict[str, Any]:
+    """Normalize a repo config entry into dict form."""
     if isinstance(entry, str):
         return {"repo_id": entry}
     if isinstance(entry, dict):
@@ -498,6 +533,7 @@ def _resolve_manifest_paths(
     valid_manifest_name: str,
     require_valid: bool,
 ) -> tuple[Path, Path | None]:
+    """Resolve train/validation manifests under one local dataset snapshot."""
     train_manifest = repo_root / train_manifest_name
     if not train_manifest.exists():
         raise RuntimeError(f"Missing train manifest at {train_manifest}")
@@ -516,6 +552,7 @@ def _resolve_repo_manifests(
     config_path: Path | None,
     token: str | None,
 ) -> tuple[list[Path], list[Path]]:
+    """Resolve training and validation manifests from CLI paths or configured repos."""
     if args.train_manifests:
         train_manifests = [Path(p) for p in _split_csv(args.train_manifests)]
         valid_manifests = [Path(p) for p in _split_csv(args.valid_manifests)] if args.valid_manifests else []
@@ -599,6 +636,7 @@ def _resolve_repo_manifests(
 
 
 def main() -> None:
+    """Run the full STS PEFT training workflow from config parsing to final save."""
     parser = argparse.ArgumentParser(
         description="Train a PEFT/LoRA S2S model on Mimi tokenized manifests."
     )
@@ -617,7 +655,7 @@ def main() -> None:
     parser.add_argument(
         "--task-token",
         type=str,
-        default="<TASK_S2ST_EN_LG>",
+        default="<TASK_S2ST_LG_EN>",
         help="Human-readable task token name stored in mapping metadata.",
     )
 

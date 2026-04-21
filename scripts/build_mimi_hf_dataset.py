@@ -2,6 +2,18 @@
 # Copyright (c) Kyutai, all rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+"""Build a Mimi-tokenized speech translation dataset from Hugging Face audio data.
+
+This script is the shared data-preparation entrypoint for both of the PEFT flows
+we use in this repo:
+
+- speech-to-speech (STS): Luganda speech in, English speech out
+- speech-to-text translation (STT): Luganda speech in, English text out
+
+The generated dataset contains both the source/target Mimi code tensors and the
+aligned source/target text fields so the downstream STS and STT trainers can
+reuse the same manifests.
+"""
 
 import argparse
 import concurrent.futures
@@ -23,6 +35,7 @@ from moshi.models import loaders
 
 
 def _try_import_soundfile():
+    """Import `soundfile` lazily so we can fall back to torchaudio when absent."""
     try:
         import soundfile as sf  # type: ignore
     except Exception:
@@ -31,6 +44,7 @@ def _try_import_soundfile():
 
 
 def _try_import_torchaudio():
+    """Import `torchaudio` lazily for optional decode and resample support."""
     try:
         import torchaudio  # type: ignore
     except Exception:
@@ -39,12 +53,14 @@ def _try_import_torchaudio():
 
 
 def _to_mono(wav: torch.Tensor) -> torch.Tensor:
+    """Collapse multi-channel audio to mono using a simple channel mean."""
     if wav.shape[0] == 1:
         return wav
     return wav.mean(dim=0, keepdim=True)
 
 
 def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int) -> torch.Tensor:
+    """Resample a waveform to the Mimi sample rate when the source rate differs."""
     if sr == target_sr:
         return wav
     ta = _try_import_torchaudio()
@@ -66,6 +82,7 @@ def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int) -> torch.Ten
 
 
 def _pad_to_frame(wav: torch.Tensor, frame_size: int) -> tuple[torch.Tensor, int, int]:
+    """Pad a waveform so its length is an exact multiple of the Mimi frame size."""
     length = wav.shape[-1]
     frames = math.ceil(length / frame_size)
     target_len = frames * frame_size
@@ -77,6 +94,7 @@ def _pad_to_frame(wav: torch.Tensor, frame_size: int) -> tuple[torch.Tensor, int
 
 
 def _load_audio(path: str | None = None, raw_bytes: bytes | None = None) -> tuple[torch.Tensor, int]:
+    """Decode audio from a file path or raw bytes into a `[channels, time]` tensor."""
     sf = _try_import_soundfile()
     # Prefer raw bytes when present. Some HF audio entries expose a relative path
     # (e.g. "1.wav") that is not resolvable locally.
@@ -110,6 +128,12 @@ def _load_audio(path: str | None = None, raw_bytes: bytes | None = None) -> tupl
 
 
 def _audio_to_tensor(audio_obj: Any) -> tuple[torch.Tensor, int]:
+    """Normalize dataset audio objects into a float tensor and sample rate.
+
+    The Hugging Face `datasets` library can surface audio in several different
+    representations depending on decode mode and version. This helper accepts
+    the supported variants and converts them into one consistent tensor layout.
+    """
     arr = None
     sr = None
 
@@ -167,6 +191,7 @@ def _save_codes(
     cardinality: int,
     source: str,
 ):
+    """Persist Mimi code tensors together with the metadata needed downstream."""
     payload = {
         "codes": codes[:, :, :frames].cpu().short(),
         "num_frames": int(frames),
@@ -181,6 +206,7 @@ def _save_codes(
 
 
 def _encode_batch(mimi, wavs: list[torch.Tensor], device: torch.device) -> torch.Tensor:
+    """Pad a batch of waveforms and run Mimi encoding on the selected device."""
     max_len = max(w.shape[-1] for w in wavs)
     padded = []
     for w in wavs:
@@ -196,21 +222,25 @@ def _encode_batch(mimi, wavs: list[torch.Tensor], device: torch.device) -> torch
 
 
 def _sanitize_key(raw: str) -> str:
+    """Convert a record id into a filesystem-safe basename."""
     key = re.sub(r"[^a-zA-Z0-9._-]+", "_", raw).strip("_")
     return key or "item"
 
 
 def _split_list(arg: str) -> list[str]:
+    """Split a comma-separated CLI argument into trimmed entries."""
     return [x.strip() for x in arg.split(",") if x.strip()]
 
 
 def _resolve_device(device_arg: str) -> torch.device:
+    """Resolve `auto`, `cpu`, or `cuda` into a concrete torch device."""
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_arg)
 
 
 def _configure_torch_backend(device: torch.device) -> None:
+    """Enable CUDA backend settings that improve Mimi encoding throughput."""
     if device.type != "cuda":
         return
     if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
@@ -223,6 +253,7 @@ def _configure_torch_backend(device: torch.device) -> None:
 
 
 def _default_repo_id(dataset_name: str) -> str:
+    """Derive a default output dataset repo id from the input HF dataset name."""
     if "/" in dataset_name:
         namespace, name = dataset_name.split("/", 1)
         return f"{namespace}/{name}_mimi_token_version"
@@ -237,6 +268,7 @@ def _write_dataset_card(
     split_names: list[str],
     stats: dict[str, Any],
 ) -> None:
+    """Write a short dataset card describing the exported Mimi-token layout."""
     config_line = dataset_cfg if dataset_cfg else "(default)"
     lines = [
         "# Mimi Token Dataset",
@@ -250,8 +282,8 @@ def _write_dataset_card(
         "## Layout",
         "",
         "- `dataset.<split>.jsonl`: manifest for each split",
-        "- `codes/eng/<split>/*.eng.pt`: source Mimi tokens",
-        "- `codes/lug/<split>/*.lug.pt`: target Mimi tokens",
+        "- `codes/lug/<split>/*.lug.pt`: source Mimi tokens",
+        "- `codes/eng/<split>/*.eng.pt`: target Mimi tokens",
         "- `stats.json`: aggregate build stats",
         "- `build_config.json`: build-time settings",
         "",
@@ -273,6 +305,16 @@ def _prepare_item(
     sample_rate: int,
     frame_size: int,
 ) -> dict[str, Any]:
+    """Decode and normalize one dataset row ahead of batched Mimi encoding.
+
+    This stage performs the CPU-heavy work for a single example:
+
+    - load source and target audio
+    - convert to mono
+    - resample to Mimi's sample rate
+    - pad to full Mimi frames
+    - collect aligned text metadata
+    """
     row_id = row.get(id_col, f"{split}-{idx:09d}")
     row_id_str = str(row_id)
     safe_id = _sanitize_key(f"{split}-{idx:09d}-{row_id_str}")
@@ -314,6 +356,7 @@ def _flush_pending(
     mimi,
     device: torch.device,
 ) -> int:
+    """Encode a pending batch, write Mimi code files, and append manifest rows."""
     if not pending:
         return 0
 
@@ -321,8 +364,8 @@ def _flush_pending(
     tgt_codes = _encode_batch(mimi, [it["tgt_wav"] for it in pending], device=device)
 
     for i, item in enumerate(pending):
-        src_rel = Path(codes_dir_name) / "eng" / split / f"{item['safe_id']}.eng.pt"
-        tgt_rel = Path(codes_dir_name) / "lug" / split / f"{item['safe_id']}.lug.pt"
+        src_rel = Path(codes_dir_name) / "lug" / split / f"{item['safe_id']}.lug.pt"
+        tgt_rel = Path(codes_dir_name) / "eng" / split / f"{item['safe_id']}.eng.pt"
         src_path = output_dir / src_rel
         tgt_path = output_dir / tgt_rel
 
@@ -369,10 +412,11 @@ def _flush_pending(
 
 
 def main() -> None:
+    """Run the end-to-end dataset build and optional Hugging Face upload flow."""
     parser = argparse.ArgumentParser(
         description=(
             "Tokenize a Hugging Face speech-translation dataset with Mimi. "
-            "Expected columns: audio_eng, audio_lug, text_eng, text_lug."
+            "Expected columns: audio_lug, audio_eng, text_lug, text_eng."
         )
     )
     parser.add_argument("--dataset", type=str, required=True, help="HF dataset id.")
@@ -421,10 +465,10 @@ def main() -> None:
     parser.add_argument("--num-codebooks", type=int, default=8)
     parser.add_argument("--target-sr", type=int, default=24000)
     parser.add_argument("--id-col", type=str, default="id")
-    parser.add_argument("--src-audio-col", type=str, default="audio_eng")
-    parser.add_argument("--tgt-audio-col", type=str, default="audio_lug")
-    parser.add_argument("--src-text-col", type=str, default="text_eng")
-    parser.add_argument("--tgt-text-col", type=str, default="text_lug")
+    parser.add_argument("--src-audio-col", type=str, default="audio_lug")
+    parser.add_argument("--tgt-audio-col", type=str, default="audio_eng")
+    parser.add_argument("--src-text-col", type=str, default="text_lug")
+    parser.add_argument("--tgt-text-col", type=str, default="text_eng")
     parser.add_argument(
         "--hf-token",
         type=str,
@@ -514,6 +558,7 @@ def main() -> None:
                 max_inflight = max(args.batch_size, args.batch_size * max(1, args.prefetch_batches))
 
                 def submit_next(executor, queue: deque[concurrent.futures.Future]) -> bool:
+                    """Queue one more preprocessing task while source rows remain."""
                     try:
                         idx, row = next(row_iter)
                     except StopIteration:

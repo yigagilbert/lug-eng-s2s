@@ -2,6 +2,12 @@
 # Copyright (c) Kyutai, all rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+"""Run offline inference for the PEFT speech-to-speech model.
+
+The script accepts Luganda source audio or cached Mimi source codes, applies the
+trained LoRA adapter, and decodes generated English Mimi codes back to waveform
+audio.
+"""
 
 import argparse
 import json
@@ -23,6 +29,7 @@ from moshi.models import loaders
 
 
 def _try_import_soundfile():
+    """Import `soundfile` lazily so the script can fall back to torchaudio."""
     try:
         import soundfile as sf  # type: ignore
     except Exception:
@@ -31,6 +38,7 @@ def _try_import_soundfile():
 
 
 def _try_import_torchaudio():
+    """Import `torchaudio` lazily for optional audio IO and resampling."""
     try:
         import torchaudio  # type: ignore
     except Exception:
@@ -39,6 +47,7 @@ def _try_import_torchaudio():
 
 
 def _save_audio(path: Path, wav: torch.Tensor, sample_rate: int) -> None:
+    """Write a waveform tensor to disk using the first available audio backend."""
     sf = _try_import_soundfile()
     wav = wav.detach().cpu()
     if sf is not None:
@@ -51,6 +60,7 @@ def _save_audio(path: Path, wav: torch.Tensor, sample_rate: int) -> None:
 
 
 def _load_audio(path: Path) -> tuple[torch.Tensor, int]:
+    """Load audio from disk into a `[channels, time]` float tensor."""
     sf = _try_import_soundfile()
     if sf is not None:
         wav, sr = sf.read(str(path), always_2d=True)
@@ -65,12 +75,14 @@ def _load_audio(path: Path) -> tuple[torch.Tensor, int]:
 
 
 def _to_mono(wav: torch.Tensor) -> torch.Tensor:
+    """Collapse multi-channel audio to mono using a simple channel mean."""
     if wav.shape[0] == 1:
         return wav
     return wav.mean(dim=0, keepdim=True)
 
 
 def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int) -> torch.Tensor:
+    """Resample source audio to Mimi's sample rate when needed."""
     if sr == target_sr:
         return wav
 
@@ -90,6 +102,7 @@ def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int) -> torch.Ten
 
 
 def _pad_to_frame(wav: torch.Tensor, frame_size: int) -> tuple[torch.Tensor, int]:
+    """Pad a waveform to a whole number of Mimi frames."""
     length = wav.shape[-1]
     frames = math.ceil(length / frame_size)
     target_len = frames * frame_size
@@ -101,6 +114,7 @@ def _pad_to_frame(wav: torch.Tensor, frame_size: int) -> tuple[torch.Tensor, int
 
 
 def _resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
+    """Pick an inference dtype compatible with the requested device."""
     if dtype == "fp32":
         return torch.float32
     if dtype == "fp16":
@@ -115,10 +129,12 @@ def _resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
 
 
 def _load_mapping(mapping_path: Path) -> dict[str, Any]:
+    """Load the token-mapping metadata saved by training."""
     return json.loads(mapping_path.read_text(encoding="utf-8"))
 
 
 def _load_codes(path: Path, num_codebooks: int, cardinality: int) -> torch.Tensor:
+    """Load Mimi codes from disk and validate their shape and range."""
     payload = torch.load(path, map_location="cpu")
     codes = payload["codes"] if isinstance(payload, dict) and "codes" in payload else payload
     codes = torch.as_tensor(codes)
@@ -140,6 +156,7 @@ def _load_codes(path: Path, num_codebooks: int, cardinality: int) -> torch.Tenso
 
 
 def _pack_audio_codes(codes: torch.Tensor, cardinality: int, audio_token_offset: int) -> torch.Tensor:
+    """Pack `[codebook, frame]` Mimi indices into the flat audio-token sequence used by training."""
     # [K, T] -> [T*K], same layout used during training.
     k = codes.shape[0]
     offsets = (torch.arange(k).unsqueeze(1) * cardinality).long()
@@ -154,6 +171,7 @@ def _extract_audio_tokens(
     cardinality: int,
     eos_id: int | None,
 ) -> torch.Tensor:
+    """Filter generated tokens down to the valid audio-token range and stop at EOS."""
     audio_low = audio_token_offset
     audio_high = audio_token_offset + (num_codebooks * cardinality)
     out: list[int] = []
@@ -176,6 +194,7 @@ def _unpack_audio_tokens(
     num_codebooks: int,
     cardinality: int,
 ) -> torch.Tensor:
+    """Convert generated packed audio tokens back into Mimi code tensors."""
     vals = packed_tokens - audio_token_offset
     usable = (vals.numel() // num_codebooks) * num_codebooks
     if usable == 0:
@@ -197,6 +216,7 @@ def _unpack_audio_tokens(
 
 
 def _trim_to_whole_frames(audio_tokens: torch.Tensor, num_codebooks: int) -> torch.Tensor:
+    """Trim packed audio tokens so they contain only full Mimi frames."""
     usable = (audio_tokens.numel() // num_codebooks) * num_codebooks
     if usable <= 0:
         raise RuntimeError(
@@ -206,6 +226,7 @@ def _trim_to_whole_frames(audio_tokens: torch.Tensor, num_codebooks: int) -> tor
 
 
 class AudioOnlyLogitsProcessor(LogitsProcessor):
+    """Restrict generation to the audio-token range plus optional EOS."""
     def __init__(
         self,
         vocab_size: int,
@@ -230,6 +251,7 @@ class AudioOnlyLogitsProcessor(LogitsProcessor):
         self.valid_mask = valid_mask
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Mask out logits that do not belong to the allowed output token set."""
         if scores.shape[-1] != self.valid_mask.numel():
             raise RuntimeError(
                 f"Logits size mismatch: logits={scores.shape[-1]}, mask={self.valid_mask.numel()}."
@@ -239,6 +261,7 @@ class AudioOnlyLogitsProcessor(LogitsProcessor):
 
 
 def _load_source_from_manifest(manifest: Path, index: int) -> Path:
+    """Resolve a source Mimi-code path from one manifest row."""
     with manifest.open("r", encoding="utf-8") as f:
         for i, ln in enumerate(f):
             if i != index:
@@ -253,10 +276,11 @@ def _load_source_from_manifest(manifest: Path, index: int) -> Path:
 
 
 def main() -> None:
+    """Run the full STS inference flow from source audio/codes to output waveform."""
     parser = argparse.ArgumentParser(
         description=(
             "Sample inference for PEFT Mimi S2S model: "
-            "English source (audio or Mimi codes) -> generated Luganda audio."
+            "Luganda source (audio or Mimi codes) -> generated English audio."
         )
     )
     parser.add_argument("--adapter-dir", type=str, required=True,
@@ -268,7 +292,7 @@ def main() -> None:
     parser.add_argument("--task-token", type=str, default="",
                         help="Optional task token label override for logs only.")
     parser.add_argument("--src-audio", type=str, default="",
-                        help="Path to source English audio file to encode with Mimi.")
+                        help="Path to source Luganda audio file to encode with Mimi.")
     parser.add_argument("--src-codes", type=str, default="",
                         help="Path to source Mimi code .pt file.")
     parser.add_argument("--manifest", type=str, default="",

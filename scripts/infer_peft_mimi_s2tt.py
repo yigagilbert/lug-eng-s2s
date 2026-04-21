@@ -2,6 +2,11 @@
 # Copyright (c) Kyutai, all rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+"""Run offline inference for the PEFT speech-to-text translation model.
+
+The script accepts Luganda source audio or cached Mimi source codes, applies the
+trained LoRA adapter, and decodes the generated output into English text.
+"""
 
 import argparse
 import json
@@ -23,6 +28,7 @@ from moshi.models import loaders
 
 
 def _try_import_soundfile():
+    """Import `soundfile` lazily so the script can fall back to torchaudio."""
     try:
         import soundfile as sf  # type: ignore
     except Exception:
@@ -31,6 +37,7 @@ def _try_import_soundfile():
 
 
 def _try_import_torchaudio():
+    """Import `torchaudio` lazily for optional audio IO and resampling."""
     try:
         import torchaudio  # type: ignore
     except Exception:
@@ -39,6 +46,7 @@ def _try_import_torchaudio():
 
 
 def _load_audio(path: Path) -> tuple[torch.Tensor, int]:
+    """Load audio from disk into a `[channels, time]` float tensor."""
     sf = _try_import_soundfile()
     if sf is not None:
         wav, sr = sf.read(str(path), always_2d=True)
@@ -53,12 +61,14 @@ def _load_audio(path: Path) -> tuple[torch.Tensor, int]:
 
 
 def _to_mono(wav: torch.Tensor) -> torch.Tensor:
+    """Collapse multi-channel audio to mono using a simple channel mean."""
     if wav.shape[0] == 1:
         return wav
     return wav.mean(dim=0, keepdim=True)
 
 
 def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int) -> torch.Tensor:
+    """Resample source audio to Mimi's sample rate when needed."""
     if sr == target_sr:
         return wav
 
@@ -77,6 +87,7 @@ def _resample_if_needed(wav: torch.Tensor, sr: int, target_sr: int) -> torch.Ten
 
 
 def _pad_to_frame(wav: torch.Tensor, frame_size: int) -> tuple[torch.Tensor, int]:
+    """Pad a waveform to a whole number of Mimi frames."""
     length = wav.shape[-1]
     frames = math.ceil(length / frame_size)
     target_len = frames * frame_size
@@ -88,6 +99,7 @@ def _pad_to_frame(wav: torch.Tensor, frame_size: int) -> tuple[torch.Tensor, int
 
 
 def _resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
+    """Pick an inference dtype compatible with the requested device."""
     if dtype == "fp32":
         return torch.float32
     if dtype == "fp16":
@@ -102,10 +114,12 @@ def _resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
 
 
 def _load_mapping(mapping_path: Path) -> dict[str, Any]:
+    """Load the token-mapping metadata saved by training."""
     return json.loads(mapping_path.read_text(encoding="utf-8"))
 
 
 def _load_codes(path: Path, num_codebooks: int, cardinality: int) -> torch.Tensor:
+    """Load Mimi codes from disk and validate their shape and range."""
     payload = torch.load(path, map_location="cpu")
     codes = payload["codes"] if isinstance(payload, dict) and "codes" in payload else payload
     codes = torch.as_tensor(codes)
@@ -127,12 +141,14 @@ def _load_codes(path: Path, num_codebooks: int, cardinality: int) -> torch.Tenso
 
 
 def _pack_audio_codes(codes: torch.Tensor, cardinality: int, audio_token_offset: int) -> torch.Tensor:
+    """Pack `[codebook, frame]` Mimi indices into the flat audio-token sequence used by training."""
     offsets = (torch.arange(codes.shape[0]).unsqueeze(1) * cardinality).long()
     packed = (codes + offsets).transpose(0, 1).reshape(-1)
     return packed + audio_token_offset
 
 
 def _trim_to_whole_frames(audio_tokens: torch.Tensor, num_codebooks: int) -> torch.Tensor:
+    """Trim packed audio tokens so they contain only full Mimi frames."""
     usable = (audio_tokens.numel() // num_codebooks) * num_codebooks
     if usable <= 0:
         raise RuntimeError(
@@ -142,6 +158,7 @@ def _trim_to_whole_frames(audio_tokens: torch.Tensor, num_codebooks: int) -> tor
 
 
 def _extract_text_tokens(generated: torch.Tensor, text_vocab_size: int, eos_id: int | None) -> torch.Tensor:
+    """Filter generated tokens down to the base text vocabulary and stop at EOS."""
     out: list[int] = []
     for tok in generated.tolist():
         if eos_id is not None and tok == eos_id:
@@ -152,6 +169,7 @@ def _extract_text_tokens(generated: torch.Tensor, text_vocab_size: int, eos_id: 
 
 
 class TextOnlyLogitsProcessor(LogitsProcessor):
+    """Restrict generation to the base text vocabulary plus optional EOS."""
     def __init__(self, vocab_size: int, text_vocab_size: int, eos_id: int | None):
         super().__init__()
         if not (0 < text_vocab_size <= vocab_size):
@@ -169,6 +187,7 @@ class TextOnlyLogitsProcessor(LogitsProcessor):
         self.valid_mask = valid_mask
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Mask out logits that do not belong to the allowed output token set."""
         if scores.shape[-1] != self.valid_mask.numel():
             raise RuntimeError(
                 f"Logits size mismatch: logits={scores.shape[-1]}, mask={self.valid_mask.numel()}."
@@ -178,6 +197,7 @@ class TextOnlyLogitsProcessor(LogitsProcessor):
 
 
 def _load_source_from_manifest(manifest: Path, index: int) -> Path:
+    """Resolve a source Mimi-code path from one manifest row."""
     with manifest.open("r", encoding="utf-8") as f:
         for i, ln in enumerate(f):
             if i != index:
@@ -192,10 +212,11 @@ def _load_source_from_manifest(manifest: Path, index: int) -> Path:
 
 
 def main() -> None:
+    """Run the full STT inference flow from source audio/codes to decoded text."""
     parser = argparse.ArgumentParser(
         description=(
             "Sample inference for PEFT Mimi speech-to-text translation model: "
-            "English source audio -> generated Luganda text."
+            "Luganda source audio -> generated English text."
         )
     )
     parser.add_argument("--adapter-dir", type=str, required=True,
@@ -207,7 +228,7 @@ def main() -> None:
     parser.add_argument("--task-token", type=str, default="",
                         help="Optional task token label override for logs only.")
     parser.add_argument("--src-audio", type=str, default="",
-                        help="Path to source English audio file to encode with Mimi.")
+                        help="Path to source Luganda audio file to encode with Mimi.")
     parser.add_argument("--src-codes", type=str, default="",
                         help="Path to source Mimi code .pt file.")
     parser.add_argument("--manifest", type=str, default="",
@@ -215,7 +236,7 @@ def main() -> None:
     parser.add_argument("--index", type=int, default=0,
                         help="Row index in manifest when --manifest is used.")
     parser.add_argument("--output-text", type=str, default="",
-                        help="Optional path to save generated Luganda text.")
+                        help="Optional path to save generated English text.")
     parser.add_argument("--save-src-codes", type=str, default="",
                         help="Optional output path for encoded source Mimi codes when using --src-audio.")
     parser.add_argument("--mimi", type=str, default="",
@@ -417,7 +438,7 @@ def main() -> None:
     text_tokens = _extract_text_tokens(new_tokens, text_vocab_size=text_vocab_size, eos_id=eos_id)
     text = tokenizer.decode(text_tokens.tolist(), skip_special_tokens=True).strip()
 
-    print("\nGenerated Luganda text:\n")
+    print("\nGenerated English text:\n")
     print(text)
 
     if args.output_text:
