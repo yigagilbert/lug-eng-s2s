@@ -16,6 +16,7 @@ and emit both JSON and Markdown reports.
 """
 
 import argparse
+import concurrent.futures
 import io
 import json
 import math
@@ -25,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from collections import deque
 
 import torch
 from datasets import Audio, load_dataset
@@ -41,6 +43,26 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError(f"Expected top-level JSON object in config: {path}")
     return data
+
+
+def _resolve_device(device_arg: str) -> torch.device:
+    """Resolve `auto`, `cpu`, or `cuda` into a concrete torch device."""
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_arg)
+
+
+def _configure_torch_backend(device: torch.device) -> None:
+    """Enable CUDA backend settings that improve batched analysis throughput."""
+    if device.type != "cuda":
+        return
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = True
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
 
 
 def _try_import_soundfile():
@@ -294,6 +316,235 @@ def _estimate_activity(
         "is_silent": is_silent,
         "is_clipped": is_clipped,
     }
+
+
+def _estimate_activity_batch_same_sr(
+    wavs: list[torch.Tensor],
+    sr: int,
+    device: torch.device,
+    window_ms: int,
+    min_active_dbfs: float,
+    relative_margin_db: float,
+) -> list[dict[str, float | bool]]:
+    """Estimate activity for a batch of waveforms that share the same sample rate."""
+    if not wavs:
+        return []
+
+    mono_wavs = [_to_mono(w).squeeze(0).to(dtype=torch.float32).contiguous() for w in wavs]
+    lengths_cpu = torch.tensor([int(w.numel()) for w in mono_wavs], dtype=torch.long)
+    max_len = int(lengths_cpu.max().item()) if lengths_cpu.numel() > 0 else 0
+    batch = torch.zeros((len(mono_wavs), max_len), dtype=torch.float32)
+    for i, wav in enumerate(mono_wavs):
+        batch[i, : wav.numel()] = wav
+
+    if device.type == "cuda":
+        batch = batch.pin_memory()
+        lengths_cpu = lengths_cpu.pin_memory()
+    batch = batch.to(device=device, non_blocking=(device.type == "cuda"))
+    lengths = lengths_cpu.to(device=device, non_blocking=(device.type == "cuda"))
+
+    peak = batch.abs().amax(dim=1)
+    peak_db = 20.0 * torch.log10(peak.clamp_min(1e-8))
+    duration_sec = lengths.to(dtype=torch.float32) / float(max(1, sr))
+
+    window_size = max(1, int(round(sr * float(window_ms) / 1000.0)))
+    if max_len <= window_size:
+        idx = torch.arange(max_len, device=device).unsqueeze(0)
+        sample_mask = idx < lengths.unsqueeze(1)
+        counts = sample_mask.sum(dim=1).clamp_min(1)
+        sumsq = (batch.square() * sample_mask).sum(dim=1)
+        rms = torch.sqrt((sumsq / counts).clamp_min(1e-12)).unsqueeze(1)
+        window_counts = (counts > 0).to(dtype=torch.long).unsqueeze(1)
+    else:
+        target_len = int(math.ceil(max_len / window_size) * window_size)
+        if target_len > max_len:
+            batch = torch.nn.functional.pad(batch, (0, target_len - max_len), mode="constant")
+        idx = torch.arange(target_len, device=device).unsqueeze(0)
+        sample_mask = idx < lengths.unsqueeze(1)
+        windows = batch.view(batch.shape[0], -1, window_size)
+        window_mask = sample_mask.view(sample_mask.shape[0], -1, window_size)
+        window_counts = window_mask.sum(dim=2).clamp_min(0)
+        sumsq = (windows.square() * window_mask).sum(dim=2)
+        rms = torch.sqrt((sumsq / window_counts.clamp_min(1)).clamp_min(1e-12))
+
+    window_db = 20.0 * torch.log10(rms.clamp_min(1e-8))
+    peak_db_cpu = peak_db.detach().cpu().tolist()
+    peak_cpu = peak.detach().cpu().tolist()
+    duration_cpu = duration_sec.detach().cpu().tolist()
+    window_db_cpu = window_db.detach().cpu()
+    window_counts_cpu = window_counts.detach().cpu()
+
+    out: list[dict[str, float | bool]] = []
+    for i in range(len(mono_wavs)):
+        valid_window_mask = window_counts_cpu[i] > 0
+        valid_db = window_db_cpu[i][valid_window_mask].tolist()
+        sample_peak_db = float(peak_db_cpu[i])
+        sample_peak = float(peak_cpu[i])
+        sample_duration = float(duration_cpu[i])
+        if not valid_db:
+            out.append(
+                {
+                    "duration_sec": sample_duration,
+                    "active_ratio": 0.0,
+                    "active_sec": 0.0,
+                    "leading_silence_sec": sample_duration,
+                    "trailing_silence_sec": sample_duration,
+                    "peak_dbfs": sample_peak_db,
+                    "noise_floor_dbfs": -120.0,
+                    "silence_sec": sample_duration,
+                    "is_silent": True,
+                    "is_clipped": sample_peak >= 0.999,
+                }
+            )
+            continue
+
+        noise_floor = float(_quantile(valid_db, 0.10) or -120.0)
+        ref_db = float(_quantile(valid_db, 0.95) or sample_peak_db)
+        activity_threshold = max(min_active_dbfs, ref_db - relative_margin_db)
+        active_mask = [db >= activity_threshold for db in valid_db]
+        if any(active_mask):
+            first_active = active_mask.index(True)
+            last_active = len(active_mask) - 1 - active_mask[::-1].index(True)
+            active_count = sum(1 for x in active_mask if x)
+            leading_silence_sec = (first_active * window_size) / float(sr)
+            trailing_silence_sec = ((len(active_mask) - 1 - last_active) * window_size) / float(sr)
+        else:
+            active_count = 0
+            leading_silence_sec = sample_duration
+            trailing_silence_sec = sample_duration
+
+        active_sec = min(sample_duration, (active_count * window_size) / float(sr))
+        silence_sec = max(0.0, sample_duration - active_sec)
+        active_ratio = 0.0 if sample_duration <= 0 else min(1.0, active_sec / sample_duration)
+        out.append(
+            {
+                "duration_sec": sample_duration,
+                "active_ratio": active_ratio,
+                "active_sec": active_sec,
+                "leading_silence_sec": leading_silence_sec,
+                "trailing_silence_sec": trailing_silence_sec,
+                "peak_dbfs": sample_peak_db,
+                "noise_floor_dbfs": noise_floor,
+                "silence_sec": silence_sec,
+                "is_silent": sample_peak_db < min_active_dbfs or active_count == 0,
+                "is_clipped": sample_peak >= 0.999,
+            }
+        )
+    return out
+
+
+def _estimate_activity_batch(
+    wav_sr_pairs: list[tuple[torch.Tensor, int]],
+    device: torch.device,
+    window_ms: int,
+    min_active_dbfs: float,
+    relative_margin_db: float,
+) -> list[dict[str, float | bool]]:
+    """Estimate activity for a mixed-sample-rate batch, preserving input order."""
+    grouped: dict[int, list[tuple[int, torch.Tensor]]] = {}
+    for idx, (wav, sr) in enumerate(wav_sr_pairs):
+        grouped.setdefault(int(sr), []).append((idx, wav))
+
+    out: list[dict[str, float | bool] | None] = [None] * len(wav_sr_pairs)
+    for sr, items in grouped.items():
+        stats = _estimate_activity_batch_same_sr(
+            wavs=[wav for _, wav in items],
+            sr=sr,
+            device=device,
+            window_ms=window_ms,
+            min_active_dbfs=min_active_dbfs,
+            relative_margin_db=relative_margin_db,
+        )
+        for (idx, _), item_stats in zip(items, stats):
+            out[idx] = item_stats
+    return [x for x in out if x is not None]
+
+
+def _prepare_item(
+    *,
+    idx: int,
+    row: dict[str, Any],
+    split: str,
+    id_col: str,
+    src_audio_col: str,
+    tgt_audio_col: str | None,
+    src_text_col: str | None,
+    tgt_text_col: str | None,
+) -> dict[str, Any]:
+    """Decode one dataset row into tensors and normalized text for later batched analysis."""
+    row_id = str(row.get(id_col, f"{split}-{idx:09d}"))
+    item = {
+        "row_id": row_id,
+        "src_text": _normalize_text(row.get(str(src_text_col), "")) if src_text_col else "",
+        "tgt_text": _normalize_text(row.get(str(tgt_text_col), "")) if tgt_text_col else "",
+    }
+    src_wav, src_sr = _audio_to_tensor(row[str(src_audio_col)])
+    item["src_wav"] = src_wav
+    item["src_sr"] = src_sr
+    if tgt_audio_col:
+        tgt_wav, tgt_sr = _audio_to_tensor(row[str(tgt_audio_col)])
+        item["tgt_wav"] = tgt_wav
+        item["tgt_sr"] = tgt_sr
+    return item
+
+
+def _flush_pending(
+    pending: list[dict[str, Any]],
+    acc: SplitAccumulator,
+    device: torch.device,
+    window_ms: int,
+    min_active_dbfs: float,
+    relative_margin_db: float,
+    has_target_audio: bool,
+) -> None:
+    """Analyze a pending batch and fold its metrics into the split accumulator."""
+    if not pending:
+        return
+
+    src_stats_list = _estimate_activity_batch(
+        [(item["src_wav"], int(item["src_sr"])) for item in pending],
+        device=device,
+        window_ms=window_ms,
+        min_active_dbfs=min_active_dbfs,
+        relative_margin_db=relative_margin_db,
+    )
+    tgt_stats_list: list[dict[str, float | bool] | None]
+    if has_target_audio:
+        tgt_stats_list = _estimate_activity_batch(
+            [(item["tgt_wav"], int(item["tgt_sr"])) for item in pending],
+            device=device,
+            window_ms=window_ms,
+            min_active_dbfs=min_active_dbfs,
+            relative_margin_db=relative_margin_db,
+        )
+    else:
+        tgt_stats_list = [None] * len(pending)
+
+    for item, src_stats, tgt_stats in zip(pending, src_stats_list, tgt_stats_list):
+        acc.source_audio.add(src_stats)
+        tgt_duration = None
+        if tgt_stats is not None:
+            acc.target_audio.add(tgt_stats)
+            tgt_duration = float(tgt_stats["duration_sec"])
+            src_duration = float(src_stats["duration_sec"])
+            if src_duration > 0:
+                acc.src_to_tgt_duration_ratio.append(tgt_duration / src_duration)
+
+        src_duration = float(src_stats["duration_sec"])
+        acc.source_text.add(item["src_text"], duration_sec=src_duration if item["src_text"] else None)
+        target_duration_for_text = tgt_duration if tgt_duration is not None else src_duration
+        acc.target_text.add(
+            item["tgt_text"],
+            duration_sec=target_duration_for_text if item["tgt_text"] else None,
+        )
+        acc.add_example(
+            row_id=str(item["row_id"]),
+            src_duration_sec=src_duration,
+            src_active_ratio=float(src_stats["active_ratio"]),
+            tgt_duration_sec=tgt_duration,
+            src_text_words=_word_count(item["src_text"]),
+            tgt_text_words=_word_count(item["tgt_text"]),
+        )
 
 
 def _format_hours(seconds: float) -> float:
@@ -795,6 +1046,10 @@ def _analyze_dataset_split(
     split_name: str,
     token: str | None,
     cache_dir: str | None,
+    device: torch.device,
+    batch_size: int,
+    preprocess_workers: int,
+    prefetch_batches: int,
     window_ms: int,
     min_active_dbfs: float,
     relative_margin_db: float,
@@ -823,58 +1078,98 @@ def _analyze_dataset_split(
         ds = ds.cast_column(str(tgt_audio_col), Audio(decode=False))
 
     acc = SplitAccumulator(top_k_examples=top_k_examples)
-    for idx, row in enumerate(ds):
-        if max_samples > 0 and idx >= max_samples:
-            break
-        row_id = str(row.get(id_col, f"{split_name}-{idx:09d}"))
+    pending: list[dict[str, Any]] = []
+    row_iter = enumerate(ds)
+    max_inflight = max(batch_size, batch_size * max(1, prefetch_batches))
+
+    def _consume(item: dict[str, Any]) -> None:
         acc.rows += 1
-        try:
-            src_wav, src_sr = _audio_to_tensor(row[str(src_audio_col)])
-            src_stats = _estimate_activity(
-                src_wav,
-                src_sr,
+        pending.append(item)
+        if len(pending) >= batch_size:
+            _flush_pending(
+                pending=pending,
+                acc=acc,
+                device=device,
                 window_ms=window_ms,
                 min_active_dbfs=min_active_dbfs,
                 relative_margin_db=relative_margin_db,
+                has_target_audio=bool(tgt_audio_col),
             )
-            acc.source_audio.add(src_stats)
+            pending.clear()
 
-            tgt_duration = None
-            if tgt_audio_col:
-                tgt_wav, tgt_sr = _audio_to_tensor(row[str(tgt_audio_col)])
-                tgt_stats = _estimate_activity(
-                    tgt_wav,
-                    tgt_sr,
-                    window_ms=window_ms,
-                    min_active_dbfs=min_active_dbfs,
-                    relative_margin_db=relative_margin_db,
+    def submit_next(
+        executor: concurrent.futures.ThreadPoolExecutor,
+        queue: deque[concurrent.futures.Future],
+    ) -> bool:
+        try:
+            idx, row = next(row_iter)
+        except StopIteration:
+            return False
+        if max_samples > 0 and idx >= max_samples:
+            return False
+        future = executor.submit(
+            _prepare_item,
+            idx=idx,
+            row=row,
+            split=split_name,
+            id_col=id_col,
+            src_audio_col=str(src_audio_col),
+            tgt_audio_col=(str(tgt_audio_col) if tgt_audio_col else None),
+            src_text_col=(str(src_text_col) if src_text_col else None),
+            tgt_text_col=(str(tgt_text_col) if tgt_text_col else None),
+        )
+        queue.append(future)
+        return True
+
+    if preprocess_workers > 1:
+        inflight: deque[concurrent.futures.Future] = deque()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=preprocess_workers) as executor:
+            while len(inflight) < max_inflight and submit_next(executor, inflight):
+                pass
+
+            while inflight:
+                future = inflight.popleft()
+                try:
+                    item = future.result()
+                except Exception:
+                    acc.decode_failures += 1
+                    while len(inflight) < max_inflight and submit_next(executor, inflight):
+                        pass
+                    continue
+                _consume(item)
+                while len(inflight) < max_inflight and submit_next(executor, inflight):
+                    pass
+    else:
+        for idx, row in row_iter:
+            if max_samples > 0 and idx >= max_samples:
+                break
+            try:
+                item = _prepare_item(
+                    idx=idx,
+                    row=row,
+                    split=split_name,
+                    id_col=id_col,
+                    src_audio_col=str(src_audio_col),
+                    tgt_audio_col=(str(tgt_audio_col) if tgt_audio_col else None),
+                    src_text_col=(str(src_text_col) if src_text_col else None),
+                    tgt_text_col=(str(tgt_text_col) if tgt_text_col else None),
                 )
-                acc.target_audio.add(tgt_stats)
-                tgt_duration = float(tgt_stats["duration_sec"])
-                src_duration = float(src_stats["duration_sec"])
-                if src_duration > 0:
-                    acc.src_to_tgt_duration_ratio.append(tgt_duration / src_duration)
-        except Exception:
-            acc.decode_failures += 1
-            continue
+            except Exception:
+                acc.decode_failures += 1
+                continue
+            _consume(item)
 
-        src_text = _normalize_text(row.get(str(src_text_col), "")) if src_text_col else ""
-        tgt_text = _normalize_text(row.get(str(tgt_text_col), "")) if tgt_text_col else ""
-        src_duration = float(src_stats["duration_sec"])
-        acc.source_text.add(src_text, duration_sec=src_duration if src_text else None)
-        target_duration_for_text = tgt_duration if tgt_duration is not None else src_duration
-        acc.target_text.add(
-            tgt_text,
-            duration_sec=target_duration_for_text if tgt_text else None,
+    if pending:
+        _flush_pending(
+            pending=pending,
+            acc=acc,
+            device=device,
+            window_ms=window_ms,
+            min_active_dbfs=min_active_dbfs,
+            relative_margin_db=relative_margin_db,
+            has_target_audio=bool(tgt_audio_col),
         )
-        acc.add_example(
-            row_id=row_id,
-            src_duration_sec=src_duration,
-            src_active_ratio=float(src_stats["active_ratio"]),
-            tgt_duration_sec=tgt_duration,
-            src_text_words=_word_count(src_text),
-            tgt_text_words=_word_count(tgt_text),
-        )
+        pending.clear()
     return _finalize_split(acc)
 
 
@@ -903,6 +1198,30 @@ def main() -> None:
     )
     parser.add_argument("--hf-token", type=str, default="", help="Optional HF token.")
     parser.add_argument("--cache-dir", type=str, default="", help="Optional Hugging Face cache dir.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to run batched activity analysis on: cuda, cpu, or auto.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="How many decoded row pairs to analyze together per GPU batch.",
+    )
+    parser.add_argument(
+        "--preprocess-workers",
+        type=int,
+        default=16,
+        help="CPU worker threads used to decode audio ahead of batched analysis.",
+    )
+    parser.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=8,
+        help="How many future batches to decode ahead of the analysis device.",
+    )
     parser.add_argument("--splits", type=str, default="all", help="Comma-separated splits, or `all`.")
     parser.add_argument("--id-col", type=str, default="id")
     parser.add_argument("--src-audio-col", type=str, default="audio_lug")
@@ -948,6 +1267,9 @@ def main() -> None:
     token = _resolve_hf_token(args, config)
     dataset_entries = _resolve_dataset_entries(args, config)
     cache_dir = args.cache_dir if args.cache_dir else None
+    device = _resolve_device(args.device)
+    _configure_torch_backend(device)
+    print(f"Using analysis device: {device}")
 
     report: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -971,6 +1293,10 @@ def main() -> None:
                 split_name=split_name,
                 token=token,
                 cache_dir=cache_dir,
+                device=device,
+                batch_size=args.batch_size,
+                preprocess_workers=args.preprocess_workers,
+                prefetch_batches=args.prefetch_batches,
                 window_ms=args.window_ms,
                 min_active_dbfs=args.min_active_dbfs,
                 relative_margin_db=args.relative_margin_db,

@@ -1,0 +1,27 @@
+{
+  "hf_token_env": "HF_TOKEN",
+  "datasets": [
+    {
+      "repo_id": "yigagilbert/luganda-english-speech-waxal-and-salt",
+      "config": null,
+      "splits": "all",
+      "id_col": "id",
+      "src_audio_col": "audio_lug",
+      "tgt_audio_col": "audio_eng",
+      "src_text_col": "text_lug",
+      "tgt_text_col": "text_eng",
+      "max_samples_per_split": 0
+    },
+    {
+      "repo_id": "yigagilbert/cv24-lug-eng",
+      "config": null,
+      "splits": "all",
+      "id_col": "id",
+      "src_audio_col": "audio_lug",
+      "tgt_audio_col": "audio_eng",
+      "src_text_col": "text_lug",
+      "tgt_text_col": "text_eng",
+      "max_samples_per_split": 0
+    }
+  ]
+}
